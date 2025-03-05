@@ -1,6 +1,7 @@
 # PrisonersDilemmaSim
-Simulating and researching the prisoners dilemma study. Based on algoritmic design of different approaches to the game at hand, scores across 10,000+ games of the Prisoner's Dilemmma will return different results each time the game is simulated as shown in the images below (and results attached as a .csv file in the Git repo).  
+Simulating and researching the prisoner's dilemma study. Based on algoritmic design of different approaches to the game at hand, scores across 10,000+ games of the Prisoner's Dilemmma will return different results each time the game is simulated as shown in the images below (and results attached as a .csv file in the Git repo).  
 
+Read more about the Prisoner's Dilemma Study here: https://plato.stanford.edu/entries/prisoner-dilemma/
 
 ![strategy_pair_figure](https://github.com/user-attachments/assets/265ce637-3d95-4198-b0e0-e6049be8c7e0)
 
