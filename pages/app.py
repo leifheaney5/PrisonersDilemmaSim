@@ -476,6 +476,26 @@ app = dash.Dash(
 
 app.title = "Prisoner's Dilemma Simulation"
 
+# Use a PNG favicon (served from /assets).
+app.index_string = """<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        <link rel="icon" type="image/png" href="/assets/favicon.png">
+        {%favicon%}
+        {%css%}
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>"""
+
 # Expose the underlying Flask server for Render/Gunicorn:
 server = app.server
 
@@ -550,7 +570,19 @@ app.layout = html.Div(
         dbc.Navbar(
             dbc.Container(
                 [
-                    dbc.NavbarBrand("Prisoner's Dilemma Simulation", className="fw-semibold"),
+                    dbc.NavbarBrand(
+                        [
+                            html.Img(
+                                src="/assets/logo.png",
+                                alt="Prisoner's Dilemma Simulation logo",
+                                style={"height": "30px", "width": "30px", "marginRight": "10px"},
+                            ),
+                            html.Span("Prisoner's Dilemma Simulation", className="fw-semibold"),
+                        ],
+                        href="/",
+                        external_link=False,
+                        className="d-flex align-items-center",
+                    ),
                     dbc.NavbarToggler(id="navbar-toggler", n_clicks=0, className="ms-auto"),
                     dbc.Collapse(
                         dbc.Nav(
