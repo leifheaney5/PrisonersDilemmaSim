@@ -12,6 +12,7 @@ import plotly.express as px
 import plotly.io as pio
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from flask import request
 
 try:
     # When running under gunicorn (Render) as a package import.
@@ -192,6 +193,7 @@ app = dash.Dash(
     external_scripts=[
         "https://www.paypal.com/sdk/js?client-id=BAAl7kWTxi6DEkHN3OfgGG2D1JqpQdHd22tivmtDGJ574TMPPUoXoCqg0OlGQmeDM2aS4wbzBd0emGM7As&components=hosted-buttons&enable-funding=venmo&currency=USD"
     ],
+    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
 )
 
 app.title = "Prisoner's Dilemma Simulation"
@@ -206,7 +208,8 @@ def controls_panel() -> dbc.Card:
             [
                 dbc.Label(label, className="mb-1"),
                 html.Span("ⓘ", id=help_id, className="ms-2 muted", style={"cursor": "help", "userSelect": "none"}),
-                dbc.Tooltip(help_text, target=help_id, placement="right"),
+                # Mobile-friendly: allow tap/click to show tooltip (no hover on touch).
+                dbc.Tooltip(help_text, target=help_id, placement="right", trigger="hover focus click"),
             ],
             className="d-flex align-items-center",
         )
@@ -245,17 +248,16 @@ def controls_panel() -> dbc.Card:
     )
 
 
-def navbar_links() -> dbc.Nav:
-    return dbc.Nav(
-        [
-            dbc.NavLink("Overview", href="/", active="exact"),
-            dbc.NavLink("Explore", href="/explore", active="exact"),
-            dbc.NavLink("Profiles", href="/profiles", active="exact"),
-            dbc.NavLink("Experiment", href="/experiment", active="exact"),
-        ],
-        pills=True,
-        className="ms-2",
-    )
+def navbar_links() -> list[dbc.NavLink]:
+    def link(label: str, href: str):
+        return dbc.NavLink(label, href=href, active="exact", external_link=False)
+
+    return [
+        link("Overview", "/"),
+        link("Explore", "/explore"),
+        link("Profiles", "/profiles"),
+        link("Experiment", "/experiment"),
+    ]
 
 
 pio.templates.default = "plotly_white"
@@ -269,37 +271,49 @@ app.layout = html.Div(
             dbc.Container(
                 [
                     dbc.NavbarBrand("Prisoner's Dilemma Simulation", className="fw-semibold"),
-                    navbar_links(),
-                    dbc.Nav(
-                        [
-                            dbc.NavItem(
-                                dbc.Button(
-                                    "GitHub",
-                                    href="https://github.com/leifheaney5/PrisonersDilemmaSim",
-                                    target="_blank",
-                                    outline=True,
-                                    color="primary",
-                                    className="ms-3",
-                                )
-                            ),
-                            dbc.NavItem(
-                                dbc.Button(
-                                    "Donate",
-                                    href="/donate",
-                                    outline=True,
-                                    color="primary",
-                                    className="ms-2",
-                                )
-                            ),
-                        ],
-                        className="ms-auto",
+                    dbc.NavbarToggler(id="navbar-toggler", n_clicks=0, className="ms-auto"),
+                    dbc.Collapse(
+                        dbc.Nav(
+                            [
+                                dbc.NavItem(dbc.NavLink("Overview", href="/", active="exact", external_link=False)),
+                                dbc.NavItem(dbc.NavLink("Explore", href="/explore", active="exact", external_link=False)),
+                                dbc.NavItem(dbc.NavLink("Profiles", href="/profiles", active="exact", external_link=False)),
+                                dbc.NavItem(dbc.NavLink("Experiment", href="/experiment", active="exact", external_link=False)),
+                                dbc.NavItem(
+                                    dbc.Button(
+                                        "GitHub",
+                                        href="https://github.com/leifheaney5/PrisonersDilemmaSim",
+                                        target="_blank",
+                                        outline=True,
+                                        color="primary",
+                                        className="ms-lg-3 mt-2 mt-lg-0",
+                                    )
+                                ),
+                                dbc.NavItem(
+                                    dbc.Button(
+                                        "Donate",
+                                        href="/donate",
+                                        outline=True,
+                                        color="primary",
+                                        external_link=False,
+                                        className="ms-lg-2 mt-2 mt-lg-0",
+                                    )
+                                ),
+                            ],
+                            className="ms-lg-2",
+                            navbar=True,
+                        ),
+                        id="navbar-collapse",
+                        is_open=False,
                         navbar=True,
                     ),
-                ]
+                ],
+                fluid=True,
             ),
             className="app-navbar",
             dark=False,
             sticky="top",
+            expand="lg",
         ),
         dbc.Container(
             [
@@ -317,6 +331,26 @@ app.layout = html.Div(
         ),
     ],
 )
+
+
+@callback(
+    Output("navbar-collapse", "is_open"),
+    Input("navbar-toggler", "n_clicks"),
+    State("navbar-collapse", "is_open"),
+)
+def toggle_navbar(n, is_open):
+    if n:
+        return not is_open
+    return is_open
+
+
+# Ensure deep-links like `/explore` work on Render (serve the Dash index for unknown routes).
+@server.route("/<path:path>")
+def catch_all(path):
+    # Let Dash/Flask handle its own special routes.
+    if path.startswith("_dash-") or path.startswith("assets/") or path.startswith("_favicon"):
+        return ("Not Found", 404)
+    return app.index()
 
 
 # ----------------------------

@@ -43,6 +43,12 @@
   color: var(--app-text) !important;
 }
 
+@media (max-width: 992px) {
+  .app-navbar .nav-link {
+    padding: 10px 12px;
+  }
+}
+
 .glass-card,
 .card {
   background: var(--card-bg) !important;
