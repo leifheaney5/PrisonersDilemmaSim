@@ -1314,9 +1314,7 @@ def experiment_page() -> html.Div:
                                     children=[
                                         html.Br(),
                                         dbc.Alert(
-                                        "Tip: tournaments grow quadratically with strategy count (N×(N−1)/2 matchups). "
-                                        "This app now uses compact state + throttled chart updates so you can run larger sets, "
-                                        "but very large runs may still take time (especially on Render free tier).",
+                                        "Select your strategies (2 minimum, 10 maximum).",
                                             color="info",
                                             className="mb-3",
                                         ),
@@ -2214,16 +2212,30 @@ def sync_sim_settings(rounds, reps, seed, horizon_known, current):
     Output("tournament-strategies", "value"),
     Output("tournament-random-feedback", "children"),
     Input("tournament-random-10", "n_clicks"),
+    Input("tournament-strategies", "value"),
     State("tournament-seed", "value"),
     prevent_initial_call=True,
 )
-def pick_random_strategies(n_clicks, seed):
-    # Use the current seed so users can reproduce random selections;
-    # add n_clicks so repeated presses produce new samples.
+def pick_random_strategies(n_clicks, current_value, seed):
+    """
+    - Clicking "Random 10" selects 10 strategies (seed-aware).
+    - Manual selection is capped to 10 by trimming to the most recent 10.
+    """
+    triggered = dash.ctx.triggered_id
+
     names = list_strategy_names()
     if not names:
         return [], "No strategies available."
 
+    # Cap manual selection to 10
+    if triggered == "tournament-strategies":
+        v = list(current_value or [])
+        if len(v) <= 10:
+            return v, ""
+        trimmed = v[-10:]
+        return trimmed, "Max 10 strategies — trimmed to the most recent 10 selections."
+
+    # Random button
     k = min(10, len(names))
     base_seed = int(seed or 0)
     clicks = int(n_clicks or 0)
@@ -2596,8 +2608,8 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             chosen = list(strategies or [])
             if not chosen:
                 return _render(state, True, "Select at least 1 strategy to start.")
-            # Soft-limit: allow larger tournaments, but keep guardrails to prevent accidental overload.
-            max_strategies = 40
+            # Hard cap for performance/clarity
+            max_strategies = 10
             if len(chosen) > max_strategies:
                 return _render(state, True, f"Select up to {max_strategies} strategies.")
 
