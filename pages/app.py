@@ -13,7 +13,9 @@ import plotly.express as px
 import plotly.io as pio
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from flask import redirect
+import logging
+import time
+from flask import g, redirect, request
 
 try:
     # When running under gunicorn (Render) as a package import.
@@ -476,6 +478,34 @@ app.title = "Prisoner's Dilemma Simulation"
 
 # Expose the underlying Flask server for Render/Gunicorn:
 server = app.server
+
+_log = logging.getLogger("pd")
+if not _log.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+
+@server.before_request
+def _pd_start_timer():
+    g._pd_start_time = time.perf_counter()
+
+
+@server.after_request
+def _pd_log_slow_requests(resp):
+    start = getattr(g, "_pd_start_time", None)
+    if start is None:
+        return resp
+    ms = (time.perf_counter() - float(start)) * 1000.0
+    # Useful for quick triage in Render without adding a full profiler.
+    resp.headers["X-Response-Time-ms"] = f"{ms:.1f}"
+    try:
+        clen = resp.calculate_content_length()
+    except Exception:
+        clen = None
+    if request.path.startswith("/_dash-update-component") and ms >= 800:
+        _log.info("SLOW dash update: %s %s ms=%.1f bytes=%s", request.method, request.path, ms, clen)
+    elif ms >= 2000:
+        _log.info("SLOW request: %s %s ms=%.1f bytes=%s", request.method, request.path, ms, clen)
+    return resp
 
 
 def label_with_help(label: str, help_id: str, help_text: str) -> html.Div:
@@ -1303,7 +1333,9 @@ def experiment_page() -> html.Div:
                         ),
                         html.Hr(),
                         dcc.Store(id="tournament-state"),
-                        dcc.Interval(id="tournament-interval", interval=400, disabled=True),
+                        # Slightly slower tick reduces callback pressure (especially on Render / mobile),
+                        # while the backend advances multiple rounds per tick.
+                        dcc.Interval(id="tournament-interval", interval=650, disabled=True),
                         dcc.Store(id="human-match-state"),
                         dcc.Store(id="custom-strategies", data=[]),
                         dbc.Tabs(
@@ -1452,6 +1484,13 @@ def experiment_page() -> html.Div:
                                                 dbc.Col(dcc.Graph(id="tournament-leaderboard", config=GRAPH_CONFIG), md=6),
                                                 dbc.Col(dcc.Graph(id="tournament-points-timeline", config=GRAPH_CONFIG), md=6),
                                             ]
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="tournament-move-counts", config=GRAPH_CONFIG), md=12),
+                                            ],
+                                            className="g-3",
                                         ),
                                         html.Br(),
                                         dbc.Row(
@@ -2252,6 +2291,7 @@ def pick_random_strategies(n_clicks, current_value, seed):
     Output("tournament-progress", "label"),
     Output("tournament-leaderboard", "figure"),
     Output("tournament-points-timeline", "figure"),
+    Output("tournament-move-counts", "figure"),
     Output("tournament-wl-timeline", "figure"),
     Output("tournament-points-pie", "figure"),
     Output("tournament-summary-modal", "is_open"),
@@ -2397,7 +2437,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
         if not current_state:
             empty = px.scatter(title="Start a tournament to see live results")
             empty.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-            return None, interval_disabled, status, 0, "0%", empty, empty, empty, empty, False, [], [], []
+            return None, interval_disabled, status, 0, "0%", empty, empty, empty, empty, empty, False, [], [], []
 
         done = bool(current_state.get("done"))
         matches_done = int(current_state.get("matches_done", 0))
@@ -2423,6 +2463,36 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
         )
+
+        # Live counts: cooperate vs defect per strategy
+        rp_map = current_state.get("rounds_played", {}) or {}
+        coop_map = current_state.get("cooperate", {}) or {}
+        order = leaderboard.sort_values("total_points", ascending=False)["strategy"].tolist() if not leaderboard.empty else list((current_state.get("strategy_names", []) or []))
+        move_rows = []
+        for s in order:
+            rp = int(rp_map.get(s, 0))
+            c = int(coop_map.get(s, 0))
+            d = max(0, rp - c)
+            move_rows.append({"strategy": s, "move": "Cooperate", "count": c})
+            move_rows.append({"strategy": s, "move": "Defect", "count": d})
+        moves_df = pd.DataFrame(move_rows)
+        moves_fig = px.bar(
+            moves_df,
+            x="count",
+            y="strategy",
+            color="move",
+            barmode="group",
+            orientation="h",
+            title="Live move counts (Cooperate vs Defect)",
+        )
+        moves_fig.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=50, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend_title_text="Move",
+        )
+        moves_fig.update_yaxes(autorange="reversed")
 
         # Build match-level timeline series (fallback to a single snapshot if timeline empty)
         timeline = list(current_state.get("timeline", []))
@@ -2545,8 +2615,43 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             paper_bgcolor="rgba(0,0,0,0)",
         )
 
-        recent = list(current_state.get("recent", []))
-        cols = [{"name": c, "id": c} for c in (recent[0].keys() if recent else [])]
+        recent_raw = list(current_state.get("recent", []))
+        recent = recent_raw
+        cols = []
+
+        # Support compact recent format from game_logic:
+        # [rep, i, j, round, move1, move2, points1, points2]
+        if recent_raw and isinstance(recent_raw[0], (list, tuple)):
+            names = list(current_state.get("strategy_names", []) or [])
+
+            def _mv(x) -> str:
+                return "cooperate" if int(x) == 0 else "defect"
+
+            recent = []
+            for r in recent_raw:
+                try:
+                    rep_i, i, j, rnd, m1, m2, p1, p2 = r
+                    i = int(i)
+                    j = int(j)
+                    recent.append(
+                        {
+                            "rep": int(rep_i),
+                            "strategy_1": names[i] if 0 <= i < len(names) else str(i),
+                            "strategy_2": names[j] if 0 <= j < len(names) else str(j),
+                            "round": int(rnd),
+                            "move_1": _mv(m1),
+                            "move_2": _mv(m2),
+                            "points_1": int(p1),
+                            "points_2": int(p2),
+                        }
+                    )
+                except Exception:
+                    # If something unexpected slips in, fall back to raw.
+                    recent = recent_raw
+                    break
+
+        if recent and isinstance(recent[0], dict):
+            cols = [{"name": c, "id": c} for c in (recent[0].keys() if recent else [])]
 
         label = "Done" if done else f"{pct}%"
         # If done, stop ticking automatically.
@@ -2583,6 +2688,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             label,
             leaderboard_fig,
             points_timeline_fig,
+            moves_fig,
             wl_fig,
             points_pie_fig,
             modal_open,
@@ -2606,8 +2712,8 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
     if triggered == "tournament-start":
         try:
             chosen = list(strategies or [])
-            if not chosen:
-                return _render(state, True, "Select at least 1 strategy to start.")
+            if len(chosen) < 2:
+                return _render(state, True, "Select at least 2 strategies to start.")
             # Hard cap for performance/clarity
             max_strategies = 10
             if len(chosen) > max_strategies:
@@ -2642,6 +2748,8 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                 timeline_stride=timeline_stride,
                 custom_strategies=custom_map,
             )
+            # Track when we last rebuilt heavy figures/tables (for throttling).
+            state["_last_render_matches_done"] = 0
         except Exception as e:
             return _render(state, True, f"Cannot start: {e}")
         interval_disabled = False
@@ -2655,55 +2763,53 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
         # close modal + clear state
         empty = px.scatter(title="Start a tournament to see live results")
         empty.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        return None, True, "Reset.", 0, "0%", empty, empty, empty, empty, False, [], [], []
+        return None, True, "Reset.", 0, "0%", empty, empty, empty, empty, empty, False, [], [], []
 
     elif triggered == "tournament-summary-close":
         # Close the modal (keep state as-is)
         rendered = _render(state, True, status)
         # Force modal closed, keep body as-is
-        return (*rendered[:9], False, dash.no_update, *rendered[11:])
+        return (*rendered[:10], False, dash.no_update, *rendered[12:])
 
     # Tick simulation if we're running and have state.
     if triggered == "tournament-interval" and state and not state.get("done"):
         # Step the simulation aggressively, but avoid re-rendering heavy figures/tables every tick.
-        state = step_tournament(state, max_rounds=1200)
+        state = step_tournament(state, max_rounds=1400)
         interval_disabled = False
 
-        n = len(list(state.get("strategy_names", []) or []))
         matches_done = int(state.get("matches_done", 0))
         total_matches = int(state.get("total_matches", 1)) or 1
         pct = int(round(100 * (matches_done / total_matches)))
         label = "Done" if bool(state.get("done")) else f"{pct}%"
 
-        # Throttle expensive redraws as strategy count grows.
-        if n <= 12:
-            render_every = 1
-        elif n <= 20:
-            render_every = 2
-        elif n <= 30:
-            render_every = 4
-        else:
-            render_every = 6
+        last_render = int(state.get("_last_render_matches_done", 0) or 0)
+        # Aim for ~40 chart refreshes max over a full run (min 2 matches between renders).
+        render_delta = max(2, total_matches // 40)
 
-        status = f"Running… Match {matches_done}/{total_matches} (updating charts every ~{render_every} matches)"
+        status = f"Running… Match {matches_done}/{total_matches} (charts update every ~{render_delta} matches)"
 
-        # Only rebuild charts/tables periodically; keep progress/status responsive.
-        if (matches_done % render_every) != 0:
+        # Force a render when:
+        # - we crossed the delta threshold, or
+        # - the tournament just finished (so the user sees final charts + summary modal)
+        if (matches_done - last_render) < render_delta and not bool(state.get("done")):
             return (
                 state,
                 interval_disabled,
                 status,
                 pct,
                 label,
-                dash.no_update,
-                dash.no_update,
-                dash.no_update,
-                dash.no_update,
-                False,
-                dash.no_update,
-                dash.no_update,
-                dash.no_update,
+                dash.no_update,  # leaderboard
+                dash.no_update,  # points timeline
+                dash.no_update,  # move counts
+                dash.no_update,  # wl timeline
+                dash.no_update,  # pie
+                False,  # modal open (keep closed while throttling)
+                dash.no_update,  # modal body
+                dash.no_update,  # table cols
+                dash.no_update,  # table data
             )
+
+        state["_last_render_matches_done"] = matches_done
 
     return _render(state, interval_disabled, status)
 
