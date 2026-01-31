@@ -80,23 +80,11 @@ In the Render dashboard, create a new **Web Service** from this repo. Render wil
 
 ## Screenshots
 
-The images below are hosted via GitHub “user attachments”. I’m actively improving and will refresh these captures as the UI evolves.
-
-| Live experiment (tournament runner) | Profiles / analytics |
-|---|---|
-| ![Live tournament runner (leaderboard + timelines)](https://github.com/user-attachments/assets/265ce637-3d95-4198-b0e0-e6049be8c7e0) | ![Profiles view (analytics + charts)](https://github.com/user-attachments/assets/02bcb1f7-6ea7-46b8-890f-5ae9b2db10f1) |
-| ![Experiment controls and outputs](https://github.com/user-attachments/assets/804fc7dc-f2d8-487f-9bb8-425f49cdc77a) | ![Additional analytics view](https://github.com/user-attachments/assets/0a17e9d7-23e0-43c1-82e2-21aa92e13935) |
-
-### Screenshot checklist (recommended)
-If you want the README to feel “production-polished”, these are the highest-value captures:
-- Overview page (top + payoff matrix)
-- Experiment page: settings + Start/Stop/Reset + live charts
-- Tournament summary modal (winner + top 3)
-- Profiles page: scorecard + opponent breakdown + round behavior chart
-- Compare view (two strategies)
-- Play a match (human vs strategy)
-- Custom strategy builder
-- Export results (PNG/PDF)
+<img width="2348" height="1237" alt="firefox_O8TFtVMfpL" src="https://github.com/user-attachments/assets/784ce6c9-016f-4d00-9cbd-941c246b9f3c" />
+<img width="2345" height="1230" alt="firefox_8S6U49I7b4" src="https://github.com/user-attachments/assets/09b8134b-9ddd-427c-8d0b-67071d74247c" />
+<img width="2349" height="1158" alt="firefox_arKULWTOkB" src="https://github.com/user-attachments/assets/cabf8873-a6bd-418f-8891-255b5a90033f" />
+<img width="2345" height="1235" alt="firefox_j566ruD900" src="https://github.com/user-attachments/assets/68c1c73e-8b3f-43cd-9cbe-24a294ce90c0" />
+<img width="2347" height="1232" alt="firefox_ygMpUqeHqO" src="https://github.com/user-attachments/assets/4255c2af-bdf8-4b16-9f1b-866dd4fab99e" />
 
 ## Resources
 - [Axelrod-Python (Iterated Prisoner’s Dilemma library)](https://axelrod.readthedocs.io/en/stable/)
