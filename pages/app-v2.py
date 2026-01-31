@@ -95,4 +95,4 @@ def update_history_graph(selected_strategy, selected_opponent):
     return figure, metrics
 
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run(debug=True)

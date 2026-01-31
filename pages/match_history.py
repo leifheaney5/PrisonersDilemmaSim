@@ -95,4 +95,4 @@ def calculate_longest_streak(data, result_type):
     return 0  # Replace with actual streak calculation logic
 
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run(debug=True)
