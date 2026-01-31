@@ -1,14 +1,40 @@
 from __future__ import annotations
 
+import io
 from functools import lru_cache
+from pathlib import Path
 
 import dash
 from dash import Input, Output, State, callback, dcc, html, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
 import plotly.express as px
+import plotly.io as pio
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-from game_logic import list_strategy_names, simulate_tournament, strategy_summary
+try:
+    # When running under gunicorn (Render) as a package import.
+    from .game_logic import (
+        init_human_match_state,
+        init_tournament_state,
+        list_strategy_names,
+        simulate_tournament,
+        step_human_match,
+        step_tournament,
+        strategy_summary,
+    )
+except ImportError:
+    # When running locally via `python pages/app.py`.
+    from game_logic import (  # type: ignore
+        init_human_match_state,
+        init_tournament_state,
+        list_strategy_names,
+        simulate_tournament,
+        step_human_match,
+        step_tournament,
+        strategy_summary,
+    )
 
 
 # ----------------------------
@@ -65,6 +91,26 @@ STRATEGY_PROFILES: dict[str, dict[str, str]] = {
         "description": "Defects for a 3-turn block in a 6-turn cycle (CCC DDD repeating).",
         "origin": "Project-defined cyclic strategy.",
         "notes": "Creates sustained defection bursts; can trigger long retaliation cycles in grudge-like opponents.",
+    },
+    "ThePushover": {
+        "description": "Starts responsive, then eventually gives in and cooperates regardless of the opponent.",
+        "origin": "Project-defined 'softening' strategy.",
+        "notes": "Can reduce long retaliation cycles, but risks being exploited late in the match.",
+    },
+    "TheThief": {
+        "description": "Builds cooperation early, then shifts behavior later to try to take advantage.",
+        "origin": "Project-defined 'phase shift' strategy.",
+        "notes": "Useful for studying end-game betrayal and how retaliation-based opponents react.",
+    },
+    "Pattern": {
+        "description": "Repeats a fixed pattern: 3 defects, then 3 cooperates, then repeat (DDD CCC ...).",
+        "origin": "Project-defined deterministic pattern strategy.",
+        "notes": "Predictable by design; tests whether opponents adapt to periodic behavior. (Intentionally distinct from TripleThreat.)",
+    },
+    "NeverSwitchUp": {
+        "description": "Randomly chooses cooperate or defect once, then sticks with it for the entire match.",
+        "origin": "Project-defined commitment strategy (stochastic initialization).",
+        "notes": "A controlled way to test 'committed' behavior vs reactive opponents.",
     },
 }
 
@@ -134,25 +180,63 @@ def match_level(persp: pd.DataFrame) -> pd.DataFrame:
 # App + layout
 # ----------------------------
 
+_BASE_DIR = Path(__file__).resolve().parent.parent
+_ASSETS_DIR = _BASE_DIR / "assets"
 
-app = dash.Dash(__name__, suppress_callback_exceptions=True, external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+app = dash.Dash(
+    __name__,
+    suppress_callback_exceptions=True,
+    assets_folder=str(_ASSETS_DIR),
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    external_scripts=[
+        "https://www.paypal.com/sdk/js?client-id=BAAl7kWTxi6DEkHN3OfgGG2D1JqpQdHd22tivmtDGJ574TMPPUoXoCqg0OlGQmeDM2aS4wbzBd0emGM7As&components=hosted-buttons&enable-funding=venmo&currency=USD"
+    ],
+)
+
+app.title = "Prisoner's Dilemma Simulation"
+
+# Expose the underlying Flask server for Render/Gunicorn:
+server = app.server
 
 
 def controls_panel() -> dbc.Card:
+    def label_with_help(label: str, help_id: str, help_text: str):
+        return html.Div(
+            [
+                dbc.Label(label, className="mb-1"),
+                html.Span("ⓘ", id=help_id, className="ms-2 muted", style={"cursor": "help", "userSelect": "none"}),
+                dbc.Tooltip(help_text, target=help_id, placement="right"),
+            ],
+            className="d-flex align-items-center",
+        )
+
     return dbc.Card(
         [
             dbc.CardHeader(html.Div([html.Strong("Simulation settings")])),
             dbc.CardBody(
                 [
-                    dbc.Label("Rounds per match"),
+                    label_with_help(
+                        "Rounds per match",
+                        "help-rounds-per-match",
+                        "How many rounds each pair of strategies plays per match. Higher values reduce randomness but take longer.",
+                    ),
                     dcc.Slider(id="rounds-per-match", min=5, max=50, step=5, value=10, marks=None, tooltip={"placement": "bottom"}),
                     dbc.FormText("Higher = more stable results, slower updates."),
                     html.Hr(),
-                    dbc.Label("Repetitions"),
+                    label_with_help(
+                        "Repetitions",
+                        "help-repetitions",
+                        "How many times each strategy pairing is repeated. Higher values stabilize rankings but increase runtime.",
+                    ),
                     dcc.Slider(id="repetitions", min=5, max=100, step=5, value=30, marks=None, tooltip={"placement": "bottom"}),
                     dbc.FormText("How many times each strategy-pair match is repeated."),
                     html.Hr(),
-                    dbc.Label("Random seed"),
+                    label_with_help(
+                        "Random seed",
+                        "help-seed",
+                        "Controls randomness for reproducibility. Same seed + same settings should produce the same results.",
+                    ),
                     dbc.Input(id="seed", type="number", value=0, step=1),
                 ]
             ),
@@ -161,38 +245,77 @@ def controls_panel() -> dbc.Card:
     )
 
 
-def navbar() -> dbc.Nav:
+def navbar_links() -> dbc.Nav:
     return dbc.Nav(
         [
             dbc.NavLink("Overview", href="/", active="exact"),
-            dbc.NavLink("Profile Overview", href="/profiles", active="exact"),
+            dbc.NavLink("Explore", href="/explore", active="exact"),
+            dbc.NavLink("Profiles", href="/profiles", active="exact"),
+            dbc.NavLink("Experiment", href="/experiment", active="exact"),
         ],
         pills=True,
+        className="ms-2",
     )
 
 
-app.layout = dbc.Container(
-    [
+pio.templates.default = "plotly_white"
+
+app.layout = html.Div(
+    id="app-shell",
+    className="app-shell",
+    children=[
         dcc.Location(id="url", refresh=False),
-        html.Br(),
-        dbc.Row(
-            [
-                dbc.Col(html.H2("Prisoner’s Dilemma — Analytics Dashboard"), md=8),
-                dbc.Col(navbar(), md=4, className="d-flex justify-content-end align-items-center"),
-            ],
-            align="center",
+        dbc.Navbar(
+            dbc.Container(
+                [
+                    dbc.NavbarBrand("Prisoner's Dilemma Simulation", className="fw-semibold"),
+                    navbar_links(),
+                    dbc.Nav(
+                        [
+                            dbc.NavItem(
+                                dbc.Button(
+                                    "GitHub",
+                                    href="https://github.com/leifheaney5/PrisonersDilemmaSim",
+                                    target="_blank",
+                                    outline=True,
+                                    color="primary",
+                                    className="ms-3",
+                                )
+                            ),
+                            dbc.NavItem(
+                                dbc.Button(
+                                    "Donate",
+                                    href="/donate",
+                                    outline=True,
+                                    color="primary",
+                                    className="ms-2",
+                                )
+                            ),
+                        ],
+                        className="ms-auto",
+                        navbar=True,
+                    ),
+                ]
+            ),
+            className="app-navbar",
+            dark=False,
+            sticky="top",
         ),
-        html.Hr(),
-        dbc.Row(
+        dbc.Container(
             [
-                dbc.Col(controls_panel(), md=3),
-                dbc.Col(html.Div(id="page-content"), md=9),
+                html.Br(),
+                dbc.Row(
+                    [
+                        dbc.Col(controls_panel(), md=3),
+                        dbc.Col(html.Div(id="page-content"), md=9),
+                    ],
+                    className="g-3",
+                ),
+                html.Br(),
             ],
-            className="g-3",
+            fluid=True,
         ),
-        html.Br(),
     ],
-    fluid=True,
 )
 
 
@@ -200,8 +323,141 @@ app.layout = dbc.Container(
 # Pages
 # ----------------------------
 
+def about_page() -> html.Div:
+    return html.Div(
+        [
+            dbc.Card(
+                dbc.CardBody(
+                    [
+                        html.H2("Overview", className="mb-2"),
+                        html.P(
+                            "This project simulates repeated Prisoner’s Dilemma tournaments across multiple strategies, "
+                            "then lets you explore outcomes, behavior, and tradeoffs interactively.",
+                            className="muted",
+                        ),
+                        html.Hr(),
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Purpose"),
+                                                html.P(
+                                                    "Understand how strategy design affects cooperation, retaliation, and long-run payoffs.",
+                                                    className="muted",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=4,
+                                ),
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Value"),
+                                                html.P(
+                                                    "Compare strategies with reproducible runs (seeded) and see where each one wins/loses.",
+                                                    className="muted",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=4,
+                                ),
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Try it"),
+                                                html.Div(
+                                                    [
+                                                        dbc.Button("Explore results", href="/explore", color="primary", className="me-2"),
+                                                        dbc.Button("Run an experiment", href="/experiment", color="success", outline=True),
+                                                    ]
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=4,
+                                ),
+                            ],
+                            className="g-3",
+                        ),
+                        html.Br(),
+                        html.H5("Resources"),
+                        html.Ul(
+                            [
+                                html.Li(
+                                    [
+                                        html.Strong("Stanford Encyclopedia of Philosophy: "),
+                                        html.A(
+                                            "Prisoner’s Dilemma",
+                                            href="https://plato.stanford.edu/entries/prisoner-dilemma/",
+                                            target="_blank",
+                                        ),
+                                    ]
+                                ),
+                                html.Li(
+                                    [
+                                        html.Strong("Axelrod tournaments: "),
+                                        html.Span("classic repeated PD strategy competition (Tit-for-Tat and others)"),
+                                    ]
+                                ),
+                            ],
+                            className="muted",
+                        ),
+                        html.Hr(),
+                        html.P(
+                            "Tip: use the left panel to adjust rounds/repetitions/seed for the Explore and Profiles pages.",
+                            className="muted",
+                        ),
+                    ]
+                ),
+                className="glass-card",
+            )
+        ]
+    )
 
-def overview_page(rounds_per_match: int, repetitions: int, seed: int) -> html.Div:
+
+def donate_page() -> html.Div:
+    return html.Div(
+        [
+            dbc.Card(
+                dbc.CardBody(
+                    [
+                        html.H2("Support the project"),
+                        html.P(
+                            "If you find this simulator useful, you can support development via PayPal / Venmo.",
+                            className="muted",
+                        ),
+                        html.Hr(),
+                        html.Div(
+                            [
+                                html.Div(
+                                    id="paypal-container-YCXC33LAEKQ78",
+                                    style={"minHeight": "60px"},
+                                )
+                            ]
+                        ),
+                        html.Hr(),
+                        html.P(
+                            "Thank you — your support helps me keep improving the simulator and adding new features.",
+                            className="muted",
+                        ),
+                    ]
+                ),
+                className="glass-card",
+            )
+        ]
+    )
+
+
+def explore_page(rounds_per_match: int, repetitions: int, seed: int) -> html.Div:
     df = get_results(rounds_per_match, repetitions, seed)
     summary = strategy_summary(df)
 
@@ -220,22 +476,149 @@ def overview_page(rounds_per_match: int, repetitions: int, seed: int) -> html.Di
         page_size=10,
         sort_action="native",
         style_table={"overflowX": "auto"},
-        style_cell={"fontFamily": "system-ui", "fontSize": 14, "padding": "8px"},
-        style_header={"fontWeight": "700"},
+        style_cell={
+            "fontFamily": "system-ui",
+            "fontSize": 14,
+            "padding": "8px",
+            "backgroundColor": "var(--card-bg)",
+            "color": "var(--app-text)",
+            "border": "1px solid var(--card-border)",
+        },
+        style_header={
+            "fontWeight": "700",
+            "backgroundColor": "var(--card-bg)",
+            "color": "var(--app-text)",
+            "border": "1px solid var(--card-border)",
+        },
     )
 
     return html.Div(
         [
+            dcc.Download(id="explore-download"),
             dbc.Row(
                 [
-                    dbc.Col(dcc.Graph(figure=fig), md=12),
-                ]
+                    dbc.Col(dcc.Graph(id="explore-total-points-fig", figure=fig), md=9),
+                    dbc.Col(
+                        [
+                            dbc.Card(
+                                dbc.CardBody(
+                                    [
+                                        html.H5("Export", className="mb-2"),
+                                        html.P("Download results or figures.", className="muted"),
+                                        dbc.Button("Summary CSV", id="explore-export-csv", color="primary", outline=True, className="w-100 mb-2"),
+                                        dbc.Button("Figure PNG", id="explore-export-png", color="primary", outline=True, className="w-100 mb-2"),
+                                        dbc.Button("Figure PDF", id="explore-export-pdf", color="primary", outline=True, className="w-100"),
+                                    ]
+                                ),
+                                className="glass-card",
+                            )
+                        ],
+                        md=3,
+                    ),
+                ],
+                className="g-3",
             ),
             html.Hr(),
             html.H4("Summary table"),
             table,
+            html.Hr(),
+            html.H4("Strategy similarity (feature distance)"),
+            html.P(
+                "A quick comparison based on behavioral features (cooperate rate, conditional cooperation, switch rate, and points). "
+                "Lower distance means more similar behavior in this run.",
+                className="muted",
+            ),
+            dcc.Graph(figure=_strategy_similarity_heatmap(df)),
         ]
     )
+
+
+def _strategy_similarity_heatmap(df: pd.DataFrame):
+    """
+    Compute a simple feature vector per strategy and render a distance matrix heatmap.
+    """
+
+    persp = perspective_rows(df)
+    if persp.empty:
+        fig = px.imshow([[0]], text_auto=True, title="Similarity heatmap")
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        return fig
+
+    # Overall cooperation rate
+    features = persp.groupby("strategy", as_index=False).agg(
+        cooperate_rate=("move", lambda s: float((s == "cooperate").mean())),
+        avg_points=("points", lambda s: float(s.mean())),
+    )
+
+    # Conditional cooperation
+    coop_vs_def = (
+        persp[persp["opp_move"] == "defect"]
+        .groupby("strategy", as_index=False)
+        .agg(coop_after_opp_defect=("move", lambda s: float((s == "cooperate").mean())))
+    )
+    coop_vs_coop = (
+        persp[persp["opp_move"] == "cooperate"]
+        .groupby("strategy", as_index=False)
+        .agg(coop_after_opp_cooperate=("move", lambda s: float((s == "cooperate").mean())))
+    )
+    features = features.merge(coop_vs_def, on="strategy", how="left").merge(coop_vs_coop, on="strategy", how="left")
+    features["coop_after_opp_defect"] = features["coop_after_opp_defect"].fillna(0.0)
+    features["coop_after_opp_cooperate"] = features["coop_after_opp_cooperate"].fillna(0.0)
+
+    # Switch rate within each (repetition, strategy, opponent) sequence
+    def _switch_rate(group: pd.DataFrame) -> float:
+        g = group.sort_values("round")
+        if len(g) <= 1:
+            return 0.0
+        return float((g["move"].shift(1) != g["move"]).iloc[1:].mean())
+
+    switch = (
+        persp.groupby(["repetition", "strategy", "opponent"], as_index=False)
+        .apply(_switch_rate)
+        .rename(columns={None: "switch_rate"})
+    )
+    switch = switch.groupby("strategy", as_index=False).agg(switch_rate=("switch_rate", "mean"))
+    features = features.merge(switch, on="strategy", how="left")
+    features["switch_rate"] = features["switch_rate"].fillna(0.0)
+
+    # Distance matrix (euclidean on normalized features)
+    feats = features.set_index("strategy")[["cooperate_rate", "coop_after_opp_defect", "coop_after_opp_cooperate", "switch_rate", "avg_points"]]
+    # normalize each column to [0,1] when possible
+    norm = feats.copy()
+    for col in norm.columns:
+        mn = float(norm[col].min())
+        mx = float(norm[col].max())
+        if mx > mn:
+            norm[col] = (norm[col] - mn) / (mx - mn)
+        else:
+            norm[col] = 0.0
+
+    strategies = list(norm.index)
+    mat = []
+    for a in strategies:
+        row = []
+        va = norm.loc[a].to_list()
+        for b in strategies:
+            vb = norm.loc[b].to_list()
+            d = sum((float(x) - float(y)) ** 2 for x, y in zip(va, vb)) ** 0.5
+            row.append(d)
+        mat.append(row)
+
+    fig = px.imshow(
+        mat,
+        x=strategies,
+        y=strategies,
+        color_continuous_scale="Blues",
+        title="Behavior distance matrix",
+        aspect="auto",
+    )
+    fig.update_layout(
+        height=650,
+        margin=dict(l=10, r=10, t=60, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
 
 
 def profiles_page() -> html.Div:
@@ -244,6 +627,7 @@ def profiles_page() -> html.Div:
         [
             html.H3("Profile Overview"),
             html.P("Pick a strategy to see what it does and how it performs in the current simulation settings."),
+            dcc.Download(id="profile-download"),
             dbc.Row(
                 [
                     dbc.Col(
@@ -257,6 +641,21 @@ def profiles_page() -> html.Div:
                             ),
                         ],
                         md=6,
+                    ),
+                    dbc.Col(
+                        [
+                            dbc.Label("Export"),
+                            dbc.ButtonGroup(
+                                [
+                                    dbc.Button("CSV", id="profile-export-csv", outline=True, color="primary"),
+                                    dbc.Button("PNG", id="profile-export-png", outline=True, color="primary"),
+                                    dbc.Button("PDF", id="profile-export-pdf", outline=True, color="primary"),
+                                ],
+                                size="sm",
+                            ),
+                        ],
+                        md=6,
+                        className="d-flex align-items-end justify-content-end",
                     ),
                 ],
                 className="g-2",
@@ -290,9 +689,414 @@ def profiles_page() -> html.Div:
                 page_size=10,
                 sort_action="native",
                 style_table={"overflowX": "auto"},
-                style_cell={"fontFamily": "system-ui", "fontSize": 14, "padding": "8px"},
-                style_header={"fontWeight": "700"},
+                style_cell={
+                    "fontFamily": "system-ui",
+                    "fontSize": 14,
+                    "padding": "8px",
+                    "backgroundColor": "var(--card-bg)",
+                    "color": "var(--app-text)",
+                    "border": "1px solid var(--card-border)",
+                },
+                style_header={
+                    "fontWeight": "700",
+                    "backgroundColor": "var(--card-bg)",
+                    "color": "var(--app-text)",
+                    "border": "1px solid var(--card-border)",
+                },
             ),
+        ]
+    )
+
+
+def experiment_page() -> html.Div:
+    names = list_strategy_names()
+    default_names = names
+
+    return html.Div(
+        [
+            dbc.Card(
+                dbc.CardBody(
+                    [
+                        html.H3("Run an experiment (real-time)"),
+                        html.P(
+                            "Run tournaments incrementally (live) or play a match yourself against a strategy.",
+                            className="muted",
+                        ),
+                        html.Hr(),
+                        dcc.Store(id="tournament-state"),
+                        dcc.Interval(id="tournament-interval", interval=400, disabled=True),
+                        dcc.Store(id="human-match-state"),
+                        dcc.Store(id="custom-strategies", data=[]),
+                        dbc.Tabs(
+                            [
+                                dbc.Tab(
+                                    label="Tournament (live)",
+                                    tab_id="tab-tournament",
+                                    children=[
+                                        html.Br(),
+                                        dbc.Modal(
+                                            [
+                                                dbc.ModalHeader(dbc.ModalTitle("Tournament summary")),
+                                                dbc.ModalBody(id="tournament-summary-body"),
+                                                dbc.ModalFooter(
+                                                    dbc.Button(
+                                                        "Close",
+                                                        id="tournament-summary-close",
+                                                        color="secondary",
+                                                        outline=True,
+                                                        className="ms-auto",
+                                                    )
+                                                ),
+                                            ],
+                                            id="tournament-summary-modal",
+                                            is_open=False,
+                                            size="lg",
+                                            centered=True,
+                                            scrollable=True,
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Strategies"),
+                                                        dcc.Dropdown(
+                                                            id="tournament-strategies",
+                                                            options=[{"label": n, "value": n} for n in names],
+                                                            value=default_names,
+                                                            multi=True,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Rounds per match"),
+                                                        dbc.Input(id="tournament-rounds", type="number", value=10, min=1, step=1),
+                                                    ],
+                                                    md=3,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Repetitions"),
+                                                        dbc.Input(id="tournament-reps", type="number", value=20, min=1, step=1),
+                                                    ],
+                                                    md=3,
+                                                ),
+                                            ],
+                                            className="g-2",
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Seed"),
+                                                        dbc.Input(id="tournament-seed", type="number", value=0, step=1),
+                                                    ],
+                                                    md=3,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Button("Start", id="tournament-start", color="success", className="me-2"),
+                                                        dbc.Button("Stop", id="tournament-stop", color="secondary", outline=True, className="me-2"),
+                                                        dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
+                                                    ],
+                                                    md=9,
+                                                    className="d-flex align-items-end",
+                                                ),
+                                            ],
+                                            className="g-2",
+                                        ),
+                                        html.Br(),
+                                        html.Div(id="tournament-status", className="muted"),
+                                        dbc.Progress(id="tournament-progress", value=0, striped=True, animated=True, className="mt-2"),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="tournament-leaderboard"), md=6),
+                                                dbc.Col(dcc.Graph(id="tournament-points-timeline"), md=6),
+                                            ]
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="tournament-wl-timeline"), md=8),
+                                                dbc.Col(dcc.Graph(id="tournament-points-pie"), md=4),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        html.Hr(),
+                                        html.H5("Recent rounds"),
+                                        dash_table.DataTable(
+                                            id="tournament-recent-table",
+                                            page_size=10,
+                                            sort_action="native",
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={
+                                                "fontFamily": "system-ui",
+                                                "fontSize": 13,
+                                                "padding": "8px",
+                                                "backgroundColor": "var(--card-bg)",
+                                                "color": "var(--app-text)",
+                                                "border": "1px solid var(--card-border)",
+                                            },
+                                            style_header={
+                                                "fontWeight": "700",
+                                                "backgroundColor": "var(--card-bg)",
+                                                "color": "var(--app-text)",
+                                                "border": "1px solid var(--card-border)",
+                                            },
+                                        ),
+                                    ],
+                                ),
+                                dbc.Tab(
+                                    label="Play a match",
+                                    tab_id="tab-human",
+                                    children=[
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Opponent strategy"),
+                                                        dcc.Dropdown(
+                                                            id="human-opponent",
+                                                            options=[{"label": n, "value": n} for n in names],
+                                                            value=names[0] if names else None,
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Rounds"),
+                                                        dbc.Input(id="human-rounds", type="number", value=10, min=1, step=1),
+                                                    ],
+                                                    md=3,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Seed"),
+                                                        dbc.Input(id="human-seed", type="number", value=0, step=1),
+                                                    ],
+                                                    md=3,
+                                                ),
+                                            ],
+                                            className="g-2",
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Button("New match", id="human-new", color="primary", className="me-2"),
+                                                        dbc.Button("Cooperate", id="human-cooperate", color="success", className="me-2", disabled=True),
+                                                        dbc.Button("Defect", id="human-defect", color="warning", className="me-2", disabled=True),
+                                                        dbc.Button("Reset", id="human-reset", color="danger", outline=True),
+                                                    ]
+                                                )
+                                            ]
+                                        ),
+                                        html.Br(),
+                                        html.Div(id="human-status", className="muted"),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="human-score-graph"), md=12),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        html.Hr(),
+                                        dash_table.DataTable(
+                                            id="human-events",
+                                            page_size=10,
+                                            sort_action="native",
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={
+                                                "fontFamily": "system-ui",
+                                                "fontSize": 13,
+                                                "padding": "8px",
+                                                "backgroundColor": "var(--card-bg)",
+                                                "color": "var(--app-text)",
+                                                "border": "1px solid var(--card-border)",
+                                            },
+                                            style_header={
+                                                "fontWeight": "700",
+                                                "backgroundColor": "var(--card-bg)",
+                                                "color": "var(--app-text)",
+                                                "border": "1px solid var(--card-border)",
+                                            },
+                                        ),
+                                    ],
+                                ),
+                                dbc.Tab(
+                                    label="Build a strategy",
+                                    tab_id="tab-builder",
+                                    children=[
+                                        html.Br(),
+                                        html.H5("Custom strategy builder"),
+                                        html.P(
+                                            "Create a strategy using simple rules and test it in the Tournament tab.",
+                                            className="muted",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Strategy name"),
+                                                        dbc.Input(id="custom-strategy-name", value="MyStrategy", type="text"),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Start move"),
+                                                        dbc.RadioItems(
+                                                            id="custom-start-move",
+                                                            options=[
+                                                                {"label": "Cooperate", "value": "cooperate"},
+                                                                {"label": "Defect", "value": "defect"},
+                                                            ],
+                                                            value="cooperate",
+                                                            inline=True,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Rule toggles"),
+                                                        dbc.Checklist(
+                                                            id="custom-toggles",
+                                                            options=[
+                                                                {"label": "Tit-for-tat (mirror last opponent move)", "value": "tft"},
+                                                                {"label": "Grudge (defect forever after any opponent defect)", "value": "grudge"},
+                                                            ],
+                                                            value=[],
+                                                        ),
+                                                    ],
+                                                    md=12,
+                                                ),
+                                            ]
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Defect-rate threshold (after minimum history)"),
+                                                        dcc.Slider(
+                                                            id="custom-defect-threshold",
+                                                            min=0.0,
+                                                            max=1.0,
+                                                            step=0.05,
+                                                            value=0.5,
+                                                            tooltip={"placement": "bottom"},
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Minimum rounds before threshold applies"),
+                                                        dcc.Slider(
+                                                            id="custom-min-history",
+                                                            min=0,
+                                                            max=10,
+                                                            step=1,
+                                                            value=3,
+                                                            tooltip={"placement": "bottom"},
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Endgame: always defect after turn (0 = disabled)"),
+                                                        dcc.Slider(
+                                                            id="custom-endgame-after",
+                                                            min=0,
+                                                            max=30,
+                                                            step=1,
+                                                            value=0,
+                                                            tooltip={"placement": "bottom"},
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Noise: random flip probability"),
+                                                        dcc.Slider(
+                                                            id="custom-noise",
+                                                            min=0.0,
+                                                            max=0.2,
+                                                            step=0.01,
+                                                            value=0.0,
+                                                            tooltip={"placement": "bottom"},
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Button("Add strategy", id="custom-add", color="primary", className="me-2"),
+                                                        dbc.Button("Clear custom strategies", id="custom-clear", color="danger", outline=True),
+                                                    ]
+                                                )
+                                            ]
+                                        ),
+                                        html.Br(),
+                                        html.Div(id="custom-strategy-feedback", className="muted"),
+                                        html.Hr(),
+                                        html.H5("Custom strategies"),
+                                        dash_table.DataTable(
+                                            id="custom-strategy-table",
+                                            page_size=10,
+                                            sort_action="native",
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={
+                                                "fontFamily": "system-ui",
+                                                "fontSize": 13,
+                                                "padding": "8px",
+                                                "backgroundColor": "var(--card-bg)",
+                                                "color": "var(--app-text)",
+                                                "border": "1px solid var(--card-border)",
+                                            },
+                                            style_header={
+                                                "fontWeight": "700",
+                                                "backgroundColor": "var(--card-bg)",
+                                                "color": "var(--app-text)",
+                                                "border": "1px solid var(--card-border)",
+                                            },
+                                        ),
+                                    ],
+                                ),
+                            ],
+                            active_tab="tab-tournament",
+                        ),
+                    ]
+                ),
+                className="glass-card",
+            )
         ]
     )
 
@@ -312,8 +1116,14 @@ def profiles_page() -> html.Div:
 def display_page(pathname: str, rounds_per_match: int, repetitions: int, seed: int):
     if pathname == "/profiles":
         return profiles_page()
-    # default: overview
-    return overview_page(rounds_per_match, repetitions, int(seed or 0))
+    if pathname == "/experiment":
+        return experiment_page()
+    if pathname == "/explore":
+        return explore_page(rounds_per_match, repetitions, int(seed or 0))
+    if pathname == "/donate":
+        return donate_page()
+    # default: about/overview
+    return about_page()
 
 
 # ----------------------------
@@ -398,23 +1208,726 @@ def update_profile(strategy: str, rounds_per_match: int, repetitions: int, seed:
 
     by_round = (
         s_rows.groupby("round", as_index=False)
-        .agg(cooperate_rate=("move", lambda s: (s == "cooperate").mean()), avg_points=("points", "mean"))
+        .agg(cooperate_rate=("move", lambda s: float((s == "cooperate").mean())), avg_points=("points", lambda s: float(s.mean())))
     )
     by_round["round"] = by_round["round"] + 1
 
-    round_fig = px.line(
-        by_round,
-        x="round",
-        y=["cooperate_rate", "avg_points"],
-        title=f"{strategy}: behavior by round (across all opponents)",
+    # Correct visualization: cooperate_rate is [0,1], avg_points is on payoff scale.
+    round_fig = make_subplots(specs=[[{"secondary_y": True}]])
+    round_fig.add_trace(
+        go.Scatter(x=by_round["round"], y=by_round["cooperate_rate"], name="Cooperate rate", mode="lines+markers"),
+        secondary_y=False,
     )
-    round_fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=420)
-    round_fig.update_yaxes(range=[0, 1], title_text="Rate / points (see legend)")
+    round_fig.add_trace(
+        go.Scatter(x=by_round["round"], y=by_round["avg_points"], name="Avg points", mode="lines+markers"),
+        secondary_y=True,
+    )
+    round_fig.update_layout(
+        title=f"{strategy}: behavior by round (across all opponents)",
+        height=420,
+        margin=dict(l=10, r=10, t=60, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend_title_text="Metric",
+    )
+    round_fig.update_xaxes(title_text="Round")
+    round_fig.update_yaxes(title_text="Cooperate rate", range=[0, 1], secondary_y=False)
+    round_fig.update_yaxes(title_text="Avg points", secondary_y=True)
 
     columns = [{"name": c, "id": c} for c in vs.columns]
     data = vs.round(4).to_dict("records")
 
     return meta, kpis, vs_fig, round_fig, columns, data
+
+
+@callback(
+    Output("profile-download", "data"),
+    Input("profile-export-csv", "n_clicks"),
+    Input("profile-export-png", "n_clicks"),
+    Input("profile-export-pdf", "n_clicks"),
+    State("profile-strategy", "value"),
+    State("rounds-per-match", "value"),
+    State("repetitions", "value"),
+    State("seed", "value"),
+    prevent_initial_call=True,
+)
+def export_profile(_csv, _png, _pdf, strategy: str, rounds_per_match: int, repetitions: int, seed: int):
+    triggered = dash.ctx.triggered_id
+    strategy = str(strategy or "strategy")
+    rounds_per_match = int(rounds_per_match or 10)
+    repetitions = int(repetitions or 30)
+    seed = int(seed or 0)
+
+    df = get_results(rounds_per_match, repetitions, seed)
+    persp = perspective_rows(df)
+    s_rows = persp[persp["strategy"] == strategy].copy()
+
+    # Opponent breakdown (same as UI)
+    vs = (
+        s_rows.groupby("opponent", as_index=False)
+        .agg(
+            avg_points_per_round=("points", "mean"),
+            cooperate_rate=("move", lambda s: float((s == "cooperate").mean())),
+            rounds=("points", "size"),
+        )
+        .sort_values("avg_points_per_round", ascending=False)
+    )
+
+    if triggered == "profile-export-csv":
+        return dcc.send_data_frame(vs.to_csv, filename=f"{strategy}_opponent_breakdown.csv", index=False)
+
+    # Build a simple report figure (2 rows)
+    report = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.18,
+        subplot_titles=("Avg points/round vs opponent", "Behavior by round"),
+        specs=[[{}], [{"secondary_y": True}]],
+    )
+
+    report.add_trace(
+        go.Bar(x=vs["avg_points_per_round"], y=vs["opponent"], orientation="h", name="Avg points/round"),
+        row=1,
+        col=1,
+    )
+
+    by_round = (
+        s_rows.groupby("round", as_index=False)
+        .agg(
+            cooperate_rate=("move", lambda s: float((s == "cooperate").mean())),
+            avg_points=("points", lambda s: float(s.mean())),
+        )
+    )
+    by_round["round"] = by_round["round"] + 1
+
+    report.add_trace(
+        go.Scatter(x=by_round["round"], y=by_round["cooperate_rate"], mode="lines+markers", name="Cooperate rate"),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+    report.add_trace(
+        go.Scatter(x=by_round["round"], y=by_round["avg_points"], mode="lines+markers", name="Avg points"),
+        row=2,
+        col=1,
+        secondary_y=True,
+    )
+
+    report.update_layout(
+        title=f"Profile export — {strategy}",
+        height=900,
+        margin=dict(l=30, r=20, t=80, b=30),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        legend_title_text="",
+    )
+    report.update_yaxes(autorange="reversed", row=1, col=1)
+    report.update_yaxes(range=[0, 1], title_text="Cooperate rate", row=2, col=1, secondary_y=False)
+    report.update_yaxes(title_text="Avg points", row=2, col=1, secondary_y=True)
+    report.update_xaxes(title_text="Avg points/round", row=1, col=1)
+    report.update_xaxes(title_text="Round", row=2, col=1)
+
+    if triggered in {"profile-export-png", "profile-export-pdf"}:
+        fmt = "png" if triggered == "profile-export-png" else "pdf"
+        try:
+            img = pio.to_image(report, format=fmt, engine="kaleido")
+        except Exception as e:
+            # Provide a readable error to the user by downloading a text file.
+            msg = f"Export failed: {e}\n\nTip: ensure 'kaleido' is installed in your environment."
+            return dcc.send_string(msg, filename="export_error.txt")
+
+        return dcc.send_bytes(lambda b: b.write(img), filename=f"{strategy}_profile_report.{fmt}")
+
+    return dash.no_update
+
+
+@callback(
+    Output("explore-download", "data"),
+    Input("explore-export-csv", "n_clicks"),
+    Input("explore-export-png", "n_clicks"),
+    Input("explore-export-pdf", "n_clicks"),
+    State("rounds-per-match", "value"),
+    State("repetitions", "value"),
+    State("seed", "value"),
+    prevent_initial_call=True,
+)
+def export_explore(_csv, _png, _pdf, rounds_per_match: int, repetitions: int, seed: int):
+    triggered = dash.ctx.triggered_id
+    rounds_per_match = int(rounds_per_match or 10)
+    repetitions = int(repetitions or 30)
+    seed = int(seed or 0)
+
+    df = get_results(rounds_per_match, repetitions, seed)
+    summary = strategy_summary(df)
+
+    if triggered == "explore-export-csv":
+        return dcc.send_data_frame(summary.to_csv, filename="strategy_summary.csv", index=False)
+
+    fig = px.bar(
+        summary.sort_values("total_points", ascending=True),
+        x="total_points",
+        y="strategy",
+        orientation="h",
+        title="Total points by strategy (across all roles)",
+    )
+    fig.update_layout(height=600, margin=dict(l=30, r=20, t=80, b=30), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+
+    if triggered in {"explore-export-png", "explore-export-pdf"}:
+        fmt = "png" if triggered == "explore-export-png" else "pdf"
+        try:
+            img = pio.to_image(fig, format=fmt, engine="kaleido")
+        except Exception as e:
+            msg = f"Export failed: {e}\n\nTip: ensure 'kaleido' is installed in your environment."
+            return dcc.send_string(msg, filename="export_error.txt")
+
+        return dcc.send_bytes(lambda b: b.write(img), filename=f"total_points.{fmt}")
+
+    return dash.no_update
+
+
+# ----------------------------
+# Experiment callbacks
+# ----------------------------
+
+
+@callback(
+    Output("tournament-state", "data"),
+    Output("tournament-interval", "disabled"),
+    Output("tournament-status", "children"),
+    Output("tournament-progress", "value"),
+    Output("tournament-progress", "label"),
+    Output("tournament-leaderboard", "figure"),
+    Output("tournament-points-timeline", "figure"),
+    Output("tournament-wl-timeline", "figure"),
+    Output("tournament-points-pie", "figure"),
+    Output("tournament-summary-modal", "is_open"),
+    Output("tournament-summary-body", "children"),
+    Output("tournament-recent-table", "columns"),
+    Output("tournament-recent-table", "data"),
+    Input("tournament-start", "n_clicks"),
+    Input("tournament-stop", "n_clicks"),
+    Input("tournament-reset", "n_clicks"),
+    Input("tournament-summary-close", "n_clicks"),
+    Input("tournament-interval", "n_intervals"),
+    State("tournament-strategies", "value"),
+    State("tournament-rounds", "value"),
+    State("tournament-reps", "value"),
+    State("tournament-seed", "value"),
+    State("custom-strategies", "data"),
+    State("tournament-state", "data"),
+)
+def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds, reps, seed, custom_strategies, state):
+
+    def _summary_children(current_state: dict) -> html.Div:
+        names = list(current_state.get("strategy_names", []))
+        totals = current_state.get("totals", {}) or {}
+        wins = current_state.get("match_wins", {}) or {}
+        losses = current_state.get("match_losses", {}) or {}
+        ties = current_state.get("match_ties", {}) or {}
+        rounds_played = current_state.get("rounds_played", {}) or {}
+        coop = current_state.get("cooperate", {}) or {}
+
+        rows = []
+        for s in names:
+            rp = int(rounds_played.get(s, 0))
+            c = int(coop.get(s, 0))
+            coop_rate = (c / rp) if rp else 0.0
+            rows.append(
+                {
+                    "strategy": s,
+                    "total_points": int(totals.get(s, 0)),
+                    "wins": int(wins.get(s, 0)),
+                    "losses": int(losses.get(s, 0)),
+                    "ties": int(ties.get(s, 0)),
+                    "cooperate_rate": coop_rate,
+                }
+            )
+
+        df = pd.DataFrame(rows).sort_values(["total_points", "wins"], ascending=False).reset_index(drop=True)
+        winner = str(df.iloc[0]["strategy"]) if not df.empty else "—"
+        top3 = df.head(3)["strategy"].tolist() if len(df) >= 3 else df["strategy"].tolist()
+
+        # Highlights / tidbits
+        most_coop = df.sort_values("cooperate_rate", ascending=False).head(1)
+        least_coop = df.sort_values("cooperate_rate", ascending=True).head(1)
+        most_wins = df.sort_values("wins", ascending=False).head(1)
+
+        def _row_str(rdf, label, fmt):
+            if rdf.empty:
+                return html.Li([html.Strong(f"{label}: "), "—"])
+            r = rdf.iloc[0]
+            return html.Li([html.Strong(f"{label}: "), fmt(r)])
+
+        table = dash_table.DataTable(
+            columns=[
+                {"name": "Strategy", "id": "strategy"},
+                {"name": "Total points", "id": "total_points"},
+                {"name": "Wins", "id": "wins"},
+                {"name": "Losses", "id": "losses"},
+                {"name": "Ties", "id": "ties"},
+                {"name": "Cooperate rate", "id": "cooperate_rate"},
+            ],
+            data=df.round({"cooperate_rate": 4}).to_dict("records"),
+            sort_action="native",
+            page_size=10,
+            style_table={"overflowX": "auto"},
+            style_cell={
+                "fontFamily": "system-ui",
+                "fontSize": 13,
+                "padding": "8px",
+                "backgroundColor": "var(--card-bg)",
+                "color": "var(--app-text)",
+                "border": "1px solid var(--card-border)",
+            },
+            style_header={
+                "fontWeight": "700",
+                "backgroundColor": "var(--card-bg)",
+                "color": "var(--app-text)",
+                "border": "1px solid var(--card-border)",
+            },
+        )
+
+        return html.Div(
+            [
+                dbc.Alert(
+                    [
+                        html.Strong("Winner: "),
+                        winner,
+                        html.Span("  •  "),
+                        html.Strong("Top 3: "),
+                        ", ".join(top3),
+                    ],
+                    color="success",
+                    className="mb-3",
+                ),
+                html.H5("Highlights"),
+                html.Ul(
+                    [
+                        _row_str(most_wins, "Most match wins", lambda r: f"{r['strategy']} ({int(r['wins'])} wins)"),
+                        _row_str(
+                            most_coop,
+                            "Most cooperative",
+                            lambda r: f"{r['strategy']} ({float(r['cooperate_rate'])*100:.1f}%)",
+                        ),
+                        _row_str(
+                            least_coop,
+                            "Least cooperative",
+                            lambda r: f"{r['strategy']} ({float(r['cooperate_rate'])*100:.1f}%)",
+                        ),
+                    ],
+                    className="muted",
+                ),
+                html.Hr(),
+                html.H5("Full breakdown"),
+                table,
+            ]
+        )
+
+    def _render(current_state: dict | None, interval_disabled: bool, status: str):
+        if not current_state:
+            empty = px.scatter(title="Start a tournament to see live results")
+            empty.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            return None, interval_disabled, status, 0, "0%", empty, empty, empty, empty, False, [], [], []
+
+        done = bool(current_state.get("done"))
+        matches_done = int(current_state.get("matches_done", 0))
+        total_matches = int(current_state.get("total_matches", 1)) or 1
+        pct = int(round(100 * (matches_done / total_matches)))
+
+        totals = current_state.get("totals", {})
+        leaderboard = (
+            pd.DataFrame([{"strategy": k, "total_points": v} for k, v in totals.items()])
+            .sort_values("total_points", ascending=True)
+            .reset_index(drop=True)
+        )
+        leaderboard_fig = px.bar(
+            leaderboard,
+            x="total_points",
+            y="strategy",
+            orientation="h",
+            title="Live leaderboard (total points)",
+        )
+        leaderboard_fig.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=50, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+        )
+
+        # Build match-level timeline series (fallback to a single snapshot if timeline empty)
+        timeline = list(current_state.get("timeline", []))
+        if not timeline:
+            timeline = [
+                {
+                    "matches_done": matches_done,
+                    "totals": dict(current_state.get("totals", {})),
+                    "match_wins": dict(current_state.get("match_wins", {})),
+                    "match_losses": dict(current_state.get("match_losses", {})),
+                    "match_ties": dict(current_state.get("match_ties", {})),
+                }
+            ]
+
+        points_rows: list[dict] = []
+        wl_rows: list[dict] = []
+        for snap in timeline:
+            md = int(snap.get("matches_done", 0))
+            for s, v in (snap.get("totals", {}) or {}).items():
+                points_rows.append({"matches_done": md, "strategy": s, "total_points": int(v)})
+            wins = snap.get("match_wins", {}) or {}
+            losses = snap.get("match_losses", {}) or {}
+            ties = snap.get("match_ties", {}) or {}
+            for s in set(list(wins.keys()) + list(losses.keys()) + list(ties.keys())):
+                wl_rows.append(
+                    {
+                        "matches_done": md,
+                        "strategy": s,
+                        "wins": int(wins.get(s, 0)),
+                        "losses": int(losses.get(s, 0)),
+                        "ties": int(ties.get(s, 0)),
+                    }
+                )
+
+        points_df = pd.DataFrame(points_rows)
+        if not points_df.empty:
+            points_df = points_df.sort_values(["matches_done", "strategy"]).reset_index(drop=True)
+        points_timeline_fig = px.line(
+            points_df,
+            x="matches_done",
+            y="total_points",
+            color="strategy",
+            title="Total points over time (matches completed)",
+            markers=True,
+        )
+        points_timeline_fig.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=50, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend_title_text="Strategy",
+        )
+
+        wl_df = pd.DataFrame(wl_rows)
+        wl_long = pd.DataFrame(columns=["matches_done", "strategy", "metric", "value"])
+        if not wl_df.empty:
+            wl_df = wl_df.sort_values(["matches_done", "strategy"]).reset_index(drop=True)
+            wl_long = wl_df.melt(
+                id_vars=["matches_done", "strategy"],
+                value_vars=["wins", "losses", "ties"],
+                var_name="metric",
+                value_name="value",
+            )
+        wl_fig = px.line(
+            wl_long,
+            x="matches_done",
+            y="value",
+            color="strategy",
+            facet_row="metric",
+            title="Match outcomes over time (wins / losses / ties)",
+            markers=True,
+        )
+        wl_fig.update_layout(
+            height=520,
+            margin=dict(l=10, r=10, t=60, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend_title_text="Strategy",
+        )
+        wl_fig.for_each_annotation(lambda a: a.update(text=a.text.replace("metric=", "").title()))
+
+        pie_df = pd.DataFrame([{"strategy": k, "total_points": int(v)} for k, v in totals.items()])
+        points_pie_fig = px.pie(
+            pie_df,
+            names="strategy",
+            values="total_points",
+            title="Share of total points",
+            hole=0.45,
+        )
+        points_pie_fig.update_layout(
+            height=520,
+            margin=dict(l=10, r=10, t=60, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+
+        recent = list(current_state.get("recent", []))
+        cols = [{"name": c, "id": c} for c in (recent[0].keys() if recent else [])]
+
+        label = "Done" if done else f"{pct}%"
+        # If done, stop ticking automatically.
+        if done:
+            interval_disabled = True
+            status = "Done."
+
+        # Provide a richer status line when possible
+        if current_state and not done:
+            s1 = current_state.get("s1")
+            s2 = current_state.get("s2")
+            r = int(current_state.get("round", 0))
+            rpm = int(current_state.get("rounds_per_match", 0))
+            rep = int(current_state.get("rep", 0))
+            reps_total = int(current_state.get("repetitions", 0))
+            status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r}/{rpm})"
+
+        # Modal: show summary once, when the tournament completes
+        modal_open = False
+        modal_body = dash.no_update
+        if done and not bool(current_state.get("summary_shown")):
+            current_state["summary_shown"] = True
+            modal_open = True
+            modal_body = _summary_children(current_state)
+
+        return (
+            current_state,
+            interval_disabled,
+            status,
+            pct,
+            label,
+            leaderboard_fig,
+            points_timeline_fig,
+            wl_fig,
+            points_pie_fig,
+            modal_open,
+            modal_body,
+            cols,
+            recent[::-1],
+        )
+
+    triggered = dash.ctx.triggered_id
+
+    # Defaults: keep prior running state if we have it; otherwise idle.
+    interval_disabled = True
+    status = ""
+
+    # If state exists and isn't done, assume it was running unless user stopped it.
+    if state and not state.get("done"):
+        # If interval is firing, it wasn't disabled.
+        if triggered == "tournament-interval":
+            interval_disabled = False
+
+    if triggered == "tournament-start":
+        try:
+            custom_map = {s["name"]: s["config"] for s in (custom_strategies or []) if isinstance(s, dict) and "name" in s and "config" in s}
+            state = init_tournament_state(
+                strategy_names=list(strategies or []),
+                rounds_per_match=int(rounds or 10),
+                repetitions=int(reps or 10),
+                seed=int(seed or 0),
+                custom_strategies=custom_map,
+            )
+        except Exception as e:
+            return _render(state, True, f"Cannot start: {e}")
+        interval_disabled = False
+        status = "Running…"
+
+    elif triggered == "tournament-stop":
+        interval_disabled = True
+        status = "Stopped."
+
+    elif triggered == "tournament-reset":
+        # close modal + clear state
+        empty = px.scatter(title="Start a tournament to see live results")
+        empty.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        return None, True, "Reset.", 0, "0%", empty, empty, empty, empty, False, [], [], []
+
+    elif triggered == "tournament-summary-close":
+        # Close the modal (keep state as-is)
+        rendered = _render(state, True, status)
+        # Force modal closed, keep body as-is
+        return (*rendered[:9], False, dash.no_update, *rendered[11:])
+
+    # Tick simulation if we're running and have state.
+    if triggered == "tournament-interval" and state and not state.get("done"):
+        state = step_tournament(state, max_rounds=600)
+        status = "Running…"
+        interval_disabled = False
+
+    return _render(state, interval_disabled, status)
+
+
+@callback(
+    Output("human-match-state", "data"),
+    Output("human-cooperate", "disabled"),
+    Output("human-defect", "disabled"),
+    Output("human-status", "children"),
+    Output("human-score-graph", "figure"),
+    Output("human-events", "columns"),
+    Output("human-events", "data"),
+    Input("human-new", "n_clicks"),
+    Input("human-cooperate", "n_clicks"),
+    Input("human-defect", "n_clicks"),
+    Input("human-reset", "n_clicks"),
+    State("human-opponent", "value"),
+    State("human-rounds", "value"),
+    State("human-seed", "value"),
+    State("custom-strategies", "data"),
+    State("human-match-state", "data"),
+    prevent_initial_call=True,
+)
+def play_human(new, coop, defect, reset, opponent, rounds, seed, custom_strategies, state):
+    triggered = dash.ctx.triggered_id
+
+    if triggered == "human-reset":
+        empty = px.scatter(title="Start a new match to play")
+        return None, True, True, "Reset.", empty, [], []
+
+    if triggered == "human-new":
+        try:
+            custom_map = {s["name"]: s["config"] for s in (custom_strategies or []) if isinstance(s, dict) and "name" in s and "config" in s}
+            state = init_human_match_state(
+                opponent=str(opponent),
+                rounds=int(rounds or 10),
+                seed=int(seed or 0),
+                custom_strategies=custom_map,
+            )
+        except Exception as e:
+            empty = px.scatter(title="Cannot start match")
+            return None, True, True, f"Cannot start: {e}", empty, [], []
+
+    if triggered in {"human-cooperate", "human-defect"} and state and not state.get("done"):
+        move = "cooperate" if triggered == "human-cooperate" else "defect"
+        state = step_human_match(state, human_move=move)
+
+    # build UI from state
+    if not state:
+        empty = px.scatter(title="Start a new match to play")
+        return None, True, True, "", empty, [], []
+
+    events = list(state.get("events", []))
+    human_points = int(state.get("human_points", 0))
+    opp_points = int(state.get("opponent_points", 0))
+    r = int(state.get("round", 0))
+    total_r = int(state.get("rounds", 0))
+    done = bool(state.get("done"))
+
+    status = f"Round {r}/{total_r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
+    if done:
+        status += " — Finished."
+
+    # cumulative score chart
+    cum_h = []
+    cum_o = []
+    th = 0
+    to = 0
+    for e in events:
+        th += int(e["human_points"])
+        to += int(e["opponent_points"])
+        cum_h.append({"round": int(e["round"]), "player": "You", "score": th})
+        cum_o.append({"round": int(e["round"]), "player": str(state.get("opponent")), "score": to})
+
+    # Ensure the chart renders even before the first move.
+    if not events:
+        score_df = pd.DataFrame(
+            [
+                {"round": 0, "player": "You", "score": 0},
+                {"round": 0, "player": str(state.get("opponent")), "score": 0},
+            ]
+        )
+    else:
+        score_df = pd.DataFrame(cum_h + cum_o)
+    fig = px.line(score_df, x="round", y="score", color="player", title="Cumulative score")
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
+
+    cols = [{"name": c, "id": c} for c in (events[0].keys() if events else [])]
+    disabled = done
+    return state, disabled, disabled, status, fig, cols, events[::-1]
+
+
+@callback(
+    Output("custom-strategies", "data"),
+    Output("custom-strategy-feedback", "children"),
+    Output("custom-strategy-table", "columns"),
+    Output("custom-strategy-table", "data"),
+    Output("tournament-strategies", "options"),
+    Output("human-opponent", "options"),
+    Input("custom-add", "n_clicks"),
+    Input("custom-clear", "n_clicks"),
+    State("custom-strategy-name", "value"),
+    State("custom-start-move", "value"),
+    State("custom-toggles", "value"),
+    State("custom-defect-threshold", "value"),
+    State("custom-min-history", "value"),
+    State("custom-endgame-after", "value"),
+    State("custom-noise", "value"),
+    State("custom-strategies", "data"),
+    prevent_initial_call=True,
+)
+def manage_custom_strategies(
+    _add,
+    _clear,
+    name,
+    start_move,
+    toggles,
+    defect_threshold,
+    min_history,
+    endgame_after,
+    noise,
+    custom_strategies,
+):
+    builtins = list_strategy_names()
+    custom_list = list(custom_strategies or [])
+
+    def _options():
+        opts = [{"label": n, "value": n} for n in builtins]
+        for s in custom_list:
+            if isinstance(s, dict) and s.get("name"):
+                opts.append({"label": f"{s['name']} (custom)", "value": s["name"]})
+        return opts
+
+    def _table():
+        rows = []
+        for s in custom_list:
+            if not isinstance(s, dict):
+                continue
+            cfg = s.get("config", {}) or {}
+            rows.append(
+                {
+                    "name": s.get("name"),
+                    "start_move": cfg.get("start_move"),
+                    "use_tft": bool(cfg.get("use_tft")),
+                    "use_grudge": bool(cfg.get("use_grudge")),
+                    "defect_rate_threshold": cfg.get("defect_rate_threshold"),
+                    "min_history": cfg.get("min_history"),
+                    "endgame_after_turn": cfg.get("endgame_after_turn"),
+                    "noise": cfg.get("noise"),
+                }
+            )
+        cols = [{"name": c, "id": c} for c in (rows[0].keys() if rows else ["name", "start_move", "use_tft", "use_grudge", "defect_rate_threshold", "min_history", "endgame_after_turn", "noise"])]
+        return cols, rows
+
+    triggered = dash.ctx.triggered_id
+
+    if triggered == "custom-clear":
+        custom_list = []
+        cols, rows = _table()
+        return custom_list, "Cleared custom strategies.", cols, rows, _options(), _options()
+
+    if triggered == "custom-add":
+        nm = str(name or "").strip()
+        if not nm:
+            cols, rows = _table()
+            return custom_list, "Name is required.", cols, rows, _options(), _options()
+
+        if nm in builtins or any(isinstance(s, dict) and s.get("name") == nm for s in custom_list):
+            cols, rows = _table()
+            return custom_list, f"Strategy name '{nm}' already exists. Choose a different name.", cols, rows, _options(), _options()
+
+        toggles = set(toggles or [])
+        cfg = {
+            "start_move": "cooperate" if start_move == "cooperate" else "defect",
+            "use_tft": ("tft" in toggles),
+            "use_grudge": ("grudge" in toggles),
+            "defect_rate_threshold": float(defect_threshold if defect_threshold is not None else 1.0),
+            "min_history": int(min_history or 0),
+            "endgame_after_turn": int(endgame_after or 0),
+            "noise": float(noise or 0.0),
+        }
+
+        custom_list.append({"name": nm, "config": cfg})
+        cols, rows = _table()
+        return custom_list, f"Added '{nm}'. You can now select it in Tournament / Play a match.", cols, rows, _options(), _options()
+
+    cols, rows = _table()
+    return custom_list, "", cols, rows, _options(), _options()
 
 
 if __name__ == "__main__":

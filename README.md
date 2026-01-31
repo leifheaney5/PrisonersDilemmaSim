@@ -1,36 +1,37 @@
 # PrisonersDilemmaSim
 
-An interactive analytics dashboard for exploring repeated Prisoner’s Dilemma strategies and tournament results.
+**Prisoner’s Dilemma Simulation** is a public-facing web app for exploring repeated Prisoner’s Dilemma strategies, running live experiments, and comparing behaviors with analytics-first visualizations.
 
-Read more about the Prisoner’s Dilemma here: https://plato.stanford.edu/entries/prisoner-dilemma/
+Read more about the Prisoner’s Dilemma here: `https://plato.stanford.edu/entries/prisoner-dilemma/`
 
-## What’s in the demo
+## What’s in the app
 
-The Dash app (`pages/app.py`) provides:
+The Dash app (`pages/app.py`) includes:
 
-- **Overview page** (`/`)
-  - Total points per strategy (bar chart)
-  - Summary table (total points, average points/round, cooperate rate)
-- **Profile Overview page** (`/profiles`)
-  - Human-friendly **description / origin / notes** for each strategy
-  - Computed KPIs (avg points/round, match win/tie rate, cooperate rate)
-  - Performance breakdown vs each opponent + behavior by round
+- **Overview** (`/`): purpose, resources, and “what to do next”
+- **Explore** (`/explore`)
+  - Total points by strategy
+  - Summary table
+  - Strategy similarity heatmap (feature distance)
+  - Export: **CSV / PNG / PDF**
+- **Profiles** (`/profiles`)
+  - Strategy descriptions + performance KPIs
+  - Opponent breakdown and behavior-by-round charts
+  - Export: **CSV / PNG / PDF**
+- **Experiment** (`/experiment`)
+  - Live tournament runner (timelines + leaderboard + summary modal)
+  - “Play a match” vs a selected strategy
+  - Build a custom strategy (rule-based) and test it
+- **Donate** (`/donate`): PayPal hosted button
 
 ## Run locally
 
 ### 1) Install dependencies
 
-This project uses Python + Dash. You’ll need these packages installed:
-
-- `dash`
-- `dash-bootstrap-components`
-- `pandas`
-- `plotly`
-
-Install with pip:
+This project uses Python + Dash. Install dependencies:
 
 ```bash
-pip install dash dash-bootstrap-components pandas plotly
+pip install -r requirements.txt
 ```
 
 ### 2) Start the app
@@ -43,13 +44,21 @@ python pages/app.py
 
 Then open:
 
-- `http://127.0.0.1:8050/` (Overview)
-- `http://127.0.0.1:8050/profiles` (Profile Overview)
+- `http://127.0.0.1:8050/`
 
 ## Notes
 
 - **Generated artifacts** (like `results.csv` and Python `__pycache__`) are intentionally ignored via `.gitignore`.
 - The simulation is run in-memory via `pages/game_logic.py` (`simulate_tournament()`), so the UI is always driven by the current settings (rounds, repetitions, seed).
+
+## Deploy on Render
+
+This repo is set up for Render with `render.yaml`.
+
+- **Build command**: `pip install -r requirements.txt`
+- **Start command**: `gunicorn pages.app:server --bind 0.0.0.0:$PORT`
+
+In the Render dashboard, create a new **Web Service** from this repo. Render will detect `render.yaml` automatically (or you can paste the build/start commands manually).
 
 ## Screenshots (older runs)
 
