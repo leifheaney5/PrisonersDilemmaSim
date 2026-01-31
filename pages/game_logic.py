@@ -1669,6 +1669,11 @@ def init_tournament_state(
         "match_ties": {name: 0 for name in names},
         "matches_done": 0,
         "total_matches": total_matches,
+        # Recent rounds are stored in a compact format to reduce Dash JSON payload size:
+        # [rep, i, j, round, move1, move2, points1, points2]
+        # where i/j are indices into `strategy_names` and move is 0=cooperate, 1=defect.
+        "recent_format": "compact_v1",
+        "recent_columns": ["rep", "strategy_1", "strategy_2", "round", "move_1", "move_2", "points_1", "points_2"],
         "recent": [],
         # match-level timeline snapshots (for live charts)
         "timeline_limit": int(timeline_limit),
@@ -1779,18 +1784,12 @@ def step_tournament(state: dict, *, max_rounds: int = 500) -> dict:
         state["cooperate"][s1] += 1 if m1 == "cooperate" else 0
         state["cooperate"][s2] += 1 if m2 == "cooperate" else 0
 
-        state["recent"].append(
-            {
-                "rep": int(state["rep"]),
-                "strategy_1": s1,
-                "strategy_2": s2,
-                "round": int(state["round"]) + 1,
-                "move_1": m1,
-                "move_2": m2,
-                "points_1": int(p1),
-                "points_2": int(p2),
-            }
-        )
+        # Compact "recent" row for smaller JSON payloads.
+        i = int(state.get("i", 0))
+        j = int(state.get("j", 0))
+        m1c = 0 if m1 == "cooperate" else 1
+        m2c = 0 if m2 == "cooperate" else 1
+        state["recent"].append([int(state["rep"]), i, j, int(state["round"]) + 1, m1c, m2c, int(p1), int(p2)])
         if len(state["recent"]) > recent_limit:
             state["recent"] = state["recent"][-recent_limit:]
 
@@ -1817,8 +1816,9 @@ def step_tournament(state: dict, *, max_rounds: int = 500) -> dict:
             # IMPORTANT: keep snapshots compact. Repeated dict copies (with strategy names as keys)
             # balloon the JSON state and slow Dash callbacks dramatically as strategy count grows.
             md = int(state["matches_done"])
-            should_snapshot = (md % timeline_stride == 0)
-            if should_snapshot or bool(state.get("done")):
+            total_matches = int(state.get("total_matches", md) or md)
+            should_snapshot = (md % timeline_stride == 0) or (md >= total_matches)
+            if should_snapshot:
                 names: list[str] = state.get("strategy_names", [])
                 state["timeline"].append(
                     {
