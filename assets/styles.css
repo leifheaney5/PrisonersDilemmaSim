@@ -1,0 +1,80 @@
+:root {
+  /* Simple, accessibility-friendly palette */
+  --app-bg: #ffffff;
+  --app-text: #111827;
+  --card-bg: #ffffff;
+  --card-border: #e5e7eb;
+  --muted-text: #6b7280;
+  --accent: #2563eb;
+  --accent-2: #10b981;
+  --nav-bg: #ffffff;
+  --nav-border: #e5e7eb;
+}
+
+
+/* App shell */
+.app-shell {
+  min-height: 100vh;
+  background: var(--app-bg);
+  color: var(--app-text);
+}
+
+.app-navbar {
+  background: var(--nav-bg) !important;
+  border-bottom: 1px solid var(--nav-border) !important;
+}
+
+
+.app-navbar .nav-link {
+  color: var(--app-text) !important;
+}
+
+.app-navbar .nav-link:hover {
+  text-decoration: underline;
+}
+
+.app-navbar .nav-link.active {
+  color: var(--app-text) !important;
+  background: rgba(37, 99, 235, 0.10) !important;
+  border: 1px solid rgba(37, 99, 235, 0.18) !important;
+}
+
+.app-navbar .navbar-brand {
+  color: var(--app-text) !important;
+}
+
+.glass-card,
+.card {
+  background: var(--card-bg) !important;
+  border: 1px solid var(--card-border) !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.glass-card,
+.glass-card * ,
+.card,
+.card * {
+  color: var(--app-text);
+}
+
+
+.muted {
+  color: var(--muted-text) !important;
+}
+
+/* Focus states */
+a:focus,
+button:focus,
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid rgba(37, 99, 235, 0.55);
+  outline-offset: 2px;
+}
+
+/* Dash DataTable */
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner table {
+  border-color: var(--card-border) !important;
+}
+
+
