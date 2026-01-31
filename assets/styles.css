@@ -19,6 +19,30 @@
   color: var(--app-text);
 }
 
+.app-body {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.app-sidebar {
+  flex: 0 0 340px;
+  max-width: 340px;
+}
+
+.app-main {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+@media (max-width: 992px) {
+  .app-sidebar {
+    flex: 1 1 100%;
+    max-width: none;
+  }
+}
+
 .app-navbar {
   background: var(--nav-bg) !important;
   border-bottom: 1px solid var(--nav-border) !important;
@@ -66,6 +90,61 @@
 
 .muted {
   color: var(--muted-text) !important;
+}
+
+/* Scorecard pills */
+.scorecard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.score-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: rgba(17, 24, 39, 0.02);
+}
+
+.score-label {
+  font-size: 14px;
+  color: var(--app-text);
+  font-weight: 600;
+}
+
+.score-bubble {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 13px;
+  border: 1px solid transparent;
+  flex: 0 0 auto;
+}
+
+.score-bubble-yes {
+  color: #065f46;
+  background: rgba(16, 185, 129, 0.16);
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.score-bubble-no {
+  color: var(--muted-text);
+  background: rgba(107, 114, 128, 0.10);
+  border-color: rgba(107, 114, 128, 0.25);
+}
+
+@media (max-width: 576px) {
+  .scorecard-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Focus states */

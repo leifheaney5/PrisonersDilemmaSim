@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.io as pio
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from flask import request
+from flask import redirect
 
 try:
     # When running under gunicorn (Render) as a package import.
@@ -93,12 +93,12 @@ STRATEGY_PROFILES: dict[str, dict[str, str]] = {
         "origin": "Project-defined cyclic strategy.",
         "notes": "Creates sustained defection bursts; can trigger long retaliation cycles in grudge-like opponents.",
     },
-    "ThePushover": {
+    "Pushover": {
         "description": "Starts responsive, then eventually gives in and cooperates regardless of the opponent.",
         "origin": "Project-defined 'softening' strategy.",
         "notes": "Can reduce long retaliation cycles, but risks being exploited late in the match.",
     },
-    "TheThief": {
+    "Thief": {
         "description": "Builds cooperation early, then shifts behavior later to try to take advantage.",
         "origin": "Project-defined 'phase shift' strategy.",
         "notes": "Useful for studying end-game betrayal and how retaliation-based opponents react.",
@@ -113,6 +113,136 @@ STRATEGY_PROFILES: dict[str, dict[str, str]] = {
         "origin": "Project-defined commitment strategy (stochastic initialization).",
         "notes": "A controlled way to test 'committed' behavior vs reactive opponents.",
     },
+    "WinStayLoseShift": {
+        "description": "Repeats its last move if it was rewarded; otherwise switches (Pavlov / WSLS).",
+        "origin": "Classic IPD baseline (Pavlov / Win‑Stay, Lose‑Shift).",
+        "notes": "Often strong in noisy settings; can quickly return to cooperation after mutual cooperation.",
+    },
+    "TitForTwoTats": {
+        "description": "Cooperates by default; defects only after two consecutive opponent defections.",
+        "origin": "Classic forgiving TFT variant (TF2T).",
+        "notes": "More forgiving than TFT; less likely to spiral into retaliation after a single defection.",
+    },
+    "SuspiciousTitForTat": {
+        "description": "Defects on the first move, then mirrors the opponent’s previous move.",
+        "origin": "Classic TFT variant (STFT).",
+        "notes": "A 'hostile start' version of TFT; useful for testing strategies against early aggression.",
+    },
+    "GenerousTitForTat": {
+        "description": "Like TFT, but sometimes forgives defections and cooperates anyway (stochastic).",
+        "origin": "Classic TFT variant (GTFT).",
+        "notes": "Designed to sustain cooperation under noise; introduces controlled forgiveness.",
+    },
+    "Joss": {
+        "description": "TFT with occasional random defection ('spite') even after opponent cooperation.",
+        "origin": "Classic stochastic variant of TFT (Joss).",
+        "notes": "Injects unpredictability; can exploit overly trusting opponents but may reduce cooperation stability.",
+    },
+    "Prober": {
+        "description": "Probes early (D, C, C), then exploits if the opponent never retaliates; otherwise switches to TFT.",
+        "origin": "Classic 'tester' strategy (Prober).",
+        "notes": "Aims to detect unconditional cooperators; otherwise behaves similarly to TFT.",
+    },
+    "RandomPrime": {
+        "description": "Defects by default; on prime-numbered turns it plays randomly.",
+        "origin": "Project-defined novelty strategy (number-based turn schedule).",
+        "notes": "A mostly-defect strategy with periodic randomness tied to primes.",
+    },
+    "Fibonacci": {
+        "description": "Starts with a random base choice; plays it on Fibonacci-numbered turns, otherwise plays the opposite.",
+        "origin": "Project-defined novelty strategy (Fibonacci turn schedule).",
+        "notes": "Creates structured alternation driven by the Fibonacci sequence.",
+    },
+    "DefectiveFriedman": {
+        "description": "Defects on turns whose round number is a Friedman number; otherwise cooperates.",
+        "origin": "Project-defined novelty strategy inspired by Friedman numbers.",
+        "notes": "Rare, irregular defections determined by a curated Friedman set.",
+    },
+    "CooperativeProth": {
+        "description": "Cooperates on Proth-numbered turns; otherwise defects.",
+        "origin": "Project-defined novelty strategy inspired by Proth numbers.",
+        "notes": "Structured cooperation tied to a number-theory predicate.",
+    },
+    "LongTermRelationship": {
+        "description": "Cooperates when overall cooperation is high, defects when it’s low, and randomizes in the middle.",
+        "origin": "Project-defined relationship-health heuristic.",
+        "notes": "Uses overall cooperation rate as a proxy for 'trust' and adapts accordingly.",
+    },
+    "Parrot": {
+        "description": "Starts random, then copies the opponent for 5 turns, then goes random for 1 turn, repeating.",
+        "origin": "Project-defined periodic mimic strategy.",
+        "notes": "Mostly reactive (copying) with occasional 'reset' randomness.",
+    },
+    "OneStepBehind": {
+        "description": "Starts random, then always plays the opposite of the opponent’s previous move.",
+        "origin": "Project-defined anti-mirroring strategy.",
+        "notes": "Tries to 'beat' what the opponent did last round; can destabilize cooperation loops.",
+    },
+    "FriendlySquare": {
+        "description": "Cooperates on perfect-square turns (1, 4, 9, 16, …); otherwise plays randomly.",
+        "origin": "Project-defined novelty strategy (square-number schedule).",
+        "notes": "Mostly random with occasional deterministic cooperation markers.",
+    },
+    "LosingMyMind": {
+        "description": "Starts fully cooperative and becomes increasingly random each turn.",
+        "origin": "Project-defined gradual-noise strategy.",
+        "notes": "Models 'deteriorating consistency' over time without relying on match-length knowledge.",
+    },
+    "KeepingPeace": {
+        "description": "Starts cooperative and tries to keep the match as close to a tie as possible in points.",
+        "origin": "Project-defined 'tie-seeking' heuristic.",
+        "notes": "Tracks its own and the opponent’s points and adjusts to reduce score imbalance.",
+    },
+    "BadJudgeOfCharacter": {
+        "description": "Starts defecting; after 3 rounds it either defects forever or randomizes based on early opponent behavior.",
+        "origin": "Project-defined early-judgment strategy.",
+        "notes": "If the opponent defects more than cooperates in the first 3 rounds, it commits to defecting forever.",
+    },
+    "DefectiveDeputy": {
+        "description": "Defect-leaning strategy that becomes more likely to defect each turn.",
+        "origin": "Project-defined ramping defector.",
+        "notes": "A gradually-hardening policy that trends toward always defecting.",
+    },
+    "BadDivorce": {
+        "description": "Defects almost every turn, with one surprise cooperation on a random round.",
+        "origin": "Project-defined endgame-flavored strategy.",
+        "notes": "Defects N−1 times and cooperates once (never on the first move).",
+    },
+    "RandomStranger": {
+        "description": "Mostly random, but defects at the end to try to 'get one over' on the opponent.",
+        "origin": "Project-defined endgame betrayal strategy.",
+        "notes": "Random for most of the match; defects on the final turn when the horizon is known.",
+    },
+    "PastTrauma": {
+        "description": "Cooperates until the opponent defects 3 total times, then defects forever.",
+        "origin": "Project-defined threshold grudge strategy.",
+        "notes": "The three defections do not need to be consecutive.",
+    },
+    "MarkedMan": {
+        "description": "Defects about 90% of the time, cooperates about 10% (paranoia breaks occasionally).",
+        "origin": "Project-defined stochastic paranoia strategy.",
+        "notes": "A fixed-probability mixture policy (mostly defect).",
+    },
+    "Lottery": {
+        "description": "Defects throughout, then plays randomly on the final turn (if the horizon is known).",
+        "origin": "Project-defined endgame gamble strategy.",
+        "notes": "If match length is unknown, it behaves as an always-defect policy.",
+    },
+    "Shootout": {
+        "description": "Cooperates on the first move, then defects every other turn.",
+        "origin": "Project-defined alternating duel strategy.",
+        "notes": "Creates a predictable C/D rhythm after the opening cooperate.",
+    },
+    "ParkBus": {
+        "description": "Defects until it gets ahead on points, then cooperates forever.",
+        "origin": "Project-defined 'lock-in lead' strategy.",
+        "notes": "Attempts to secure an early advantage and then play defensively (cooperate) to preserve it.",
+    },
+    "Illuminati": {
+        "description": "Classified (black box).",
+        "origin": "Project-defined hidden strategy.",
+        "notes": "This strategy’s logic is intentionally not disclosed in the UI.",
+    },
 }
 
 
@@ -122,8 +252,13 @@ STRATEGY_PROFILES: dict[str, dict[str, str]] = {
 
 
 @lru_cache(maxsize=16)
-def get_results(rounds_per_match: int, repetitions: int, seed: int) -> pd.DataFrame:
-    return simulate_tournament(rounds_per_match=rounds_per_match, repetitions=repetitions, seed=seed)
+def get_results(rounds_per_match: int, repetitions: int, seed: int, horizon_known: bool) -> pd.DataFrame:
+    return simulate_tournament(
+        rounds_per_match=rounds_per_match,
+        repetitions=repetitions,
+        seed=seed,
+        horizon_known=bool(horizon_known),
+    )
 
 
 def perspective_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -178,6 +313,146 @@ def match_level(persp: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------
+# Strategy classification (tags)
+# ----------------------------
+
+
+def strategy_scorecard(name: str) -> dict[str, object]:
+    """
+    Static-ish strategy classification for UI badges/scorecards.
+
+    This is intentionally simple (human-readable, not 'perfect' taxonomy).
+    """
+
+    nm = str(name or "")
+    nm = {
+        "ThePushover": "Pushover",
+        "TheThief": "Thief",
+        "ParrotPicker": "Parrot",
+        "KeepingThePeace": "KeepingPeace",
+    }.get(nm, nm)
+
+    deterministic = nm in {
+        "MrNiceGuy",
+        "BadCop",
+        "TitForTat",
+        "WinStayLoseShift",
+        "TitForTwoTats",
+        "SuspiciousTitForTat",
+        "CalculatedDefector",
+        "HoldingAGrudge",
+        "ForgiveButDontForget",
+        "BadAlternator",
+        "RitualDefection",
+        "TripleThreat",
+        "Pushover",
+        "Thief",
+        "Pattern",
+        "OneStepBehind",
+        "KeepingPeace",
+        "ParkBus",
+        "Shootout",
+        "Illuminati",
+    }
+
+    stochastic = nm in {
+        "ImSoRandom",
+        "NeverSwitchUp",
+        "GenerousTitForTat",
+        "Joss",
+        "Prober",
+        "RandomPrime",
+        "Fibonacci",
+        "LongTermRelationship",
+        "Parrot",
+        "FriendlySquare",
+        "LosingMyMind",
+        "BadJudgeOfCharacter",
+        "DefectiveDeputy",
+        "BadDivorce",
+        "RandomStranger",
+        "MarkedMan",
+        "Lottery",
+    }
+
+    # Rough "memory depth": 0, 1, or "many"
+    if nm in {"MrNiceGuy", "BadCop", "BadAlternator", "RitualDefection", "TripleThreat", "Pattern", "FriendlySquare", "Shootout"}:
+        memory: object = 0
+    elif nm in {"TitForTat", "SuspiciousTitForTat", "WinStayLoseShift", "Joss", "OneStepBehind", "Parrot"}:
+        memory = 1
+    elif nm in {
+        "HoldingAGrudge",
+        "CalculatedDefector",
+        "ForgiveButDontForget",
+        "TitForTwoTats",
+        "Prober",
+        "LongTermRelationship",
+        "KeepingPeace",
+        "ParkBus",
+        "Illuminati",
+        "BadJudgeOfCharacter",
+        "PastTrauma",
+    }:
+        memory = "many"
+    else:
+        memory = "unknown"
+
+    # Primary tendency (very rough)
+    primary_coop = nm in {"MrNiceGuy", "TitForTat", "WinStayLoseShift", "TitForTwoTats", "GenerousTitForTat", "Pushover", "KeepingPeace"}
+    primary_defect = nm in {"BadCop", "CalculatedDefector", "HoldingAGrudge", "Thief", "OneStepBehind", "DefectiveDeputy", "BadDivorce", "ParkBus"}
+
+    # Uses turn counter / schedule
+    time_based = nm in {
+        "BadAlternator",
+        "RitualDefection",
+        "TripleThreat",
+        "Pattern",
+        "NeverSwitchUp",
+        "RandomPrime",
+        "Fibonacci",
+        "DefectiveFriedman",
+        "CooperativeProth",
+        "Parrot",
+        "FriendlySquare",
+        "LosingMyMind",
+        "Shootout",
+        "BadDivorce",
+        "RandomStranger",
+        "Lottery",
+    }
+
+    reactive = nm in {
+        "TitForTat",
+        "SuspiciousTitForTat",
+        "TitForTwoTats",
+        "WinStayLoseShift",
+        "Joss",
+        "Prober",
+        "CalculatedDefector",
+        "HoldingAGrudge",
+        "ForgiveButDontForget",
+        "Pushover",
+        "Parrot",
+        "OneStepBehind",
+        "LongTermRelationship",
+        "KeepingPeace",
+        "ParkBus",
+        "Illuminati",
+        "PastTrauma",
+    }
+
+    return {
+        "deterministic": bool(deterministic and not stochastic),
+        "stochastic": bool(stochastic),
+        "memory": memory,
+        "primarily_cooperative": bool(primary_coop),
+        "primarily_defective": bool(primary_defect),
+        "reactive": bool(reactive),
+        "time_based": bool(time_based),
+    }
+
+
+# ----------------------------
 # App + layout
 # ----------------------------
 
@@ -202,49 +477,18 @@ app.title = "Prisoner's Dilemma Simulation"
 server = app.server
 
 
-def controls_panel() -> dbc.Card:
-    def label_with_help(label: str, help_id: str, help_text: str):
-        return html.Div(
-            [
-                dbc.Label(label, className="mb-1"),
-                html.Span("ⓘ", id=help_id, className="ms-2 muted", style={"cursor": "help", "userSelect": "none"}),
-                # Mobile-friendly: allow tap/click to show tooltip (no hover on touch).
-                dbc.Tooltip(help_text, target=help_id, placement="right", trigger="hover focus click"),
-            ],
-            className="d-flex align-items-center",
-        )
+def label_with_help(label: str, help_id: str, help_text: str) -> html.Div:
+    """
+    Consistent label + help icon + tooltip pattern.
+    """
 
-    return dbc.Card(
+    return html.Div(
         [
-            dbc.CardHeader(html.Div([html.Strong("Simulation settings")])),
-            dbc.CardBody(
-                [
-                    label_with_help(
-                        "Rounds per match",
-                        "help-rounds-per-match",
-                        "How many rounds each pair of strategies plays per match. Higher values reduce randomness but take longer.",
-                    ),
-                    dcc.Slider(id="rounds-per-match", min=5, max=50, step=5, value=10, marks=None, tooltip={"placement": "bottom"}),
-                    dbc.FormText("Higher = more stable results, slower updates."),
-                    html.Hr(),
-                    label_with_help(
-                        "Repetitions",
-                        "help-repetitions",
-                        "How many times each strategy pairing is repeated. Higher values stabilize rankings but increase runtime.",
-                    ),
-                    dcc.Slider(id="repetitions", min=5, max=100, step=5, value=30, marks=None, tooltip={"placement": "bottom"}),
-                    dbc.FormText("How many times each strategy-pair match is repeated."),
-                    html.Hr(),
-                    label_with_help(
-                        "Random seed",
-                        "help-seed",
-                        "Controls randomness for reproducibility. Same seed + same settings should produce the same results.",
-                    ),
-                    dbc.Input(id="seed", type="number", value=0, step=1),
-                ]
-            ),
+            dbc.Label(label, className="mb-1"),
+            html.Span("ⓘ", id=help_id, className="ms-2 muted", style={"cursor": "help", "userSelect": "none"}),
+            dbc.Tooltip(help_text, target=help_id, placement="right", trigger="hover focus click"),
         ],
-        className="shadow-sm",
+        className="d-flex align-items-center",
     )
 
 
@@ -254,7 +498,6 @@ def navbar_links() -> list[dbc.NavLink]:
 
     return [
         link("Overview", "/"),
-        link("Explore", "/explore"),
         link("Profiles", "/profiles"),
         link("Experiment", "/experiment"),
     ]
@@ -267,6 +510,10 @@ app.layout = html.Div(
     className="app-shell",
     children=[
         dcc.Location(id="url", refresh=False),
+        dcc.Store(
+            id="sim-settings",
+            data={"rounds_per_match": 10, "repetitions": 10, "seed": 0, "horizon_known": True},
+        ),
         dbc.Navbar(
             dbc.Container(
                 [
@@ -276,7 +523,6 @@ app.layout = html.Div(
                         dbc.Nav(
                             [
                                 dbc.NavItem(dbc.NavLink("Overview", href="/", active="exact", external_link=False)),
-                                dbc.NavItem(dbc.NavLink("Explore", href="/explore", active="exact", external_link=False)),
                                 dbc.NavItem(dbc.NavLink("Profiles", href="/profiles", active="exact", external_link=False)),
                                 dbc.NavItem(dbc.NavLink("Experiment", href="/experiment", active="exact", external_link=False)),
                                 dbc.NavItem(
@@ -318,20 +564,13 @@ app.layout = html.Div(
         dbc.Container(
             [
                 html.Br(),
-                dbc.Row(
-                    [
-                        dbc.Col(controls_panel(), md=3),
-                        dbc.Col(html.Div(id="page-content"), md=9),
-                    ],
-                    className="g-3",
-                ),
+                html.Div(html.Div(id="page-content"), id="page-wrapper", className="app-main"),
                 html.Br(),
             ],
             fluid=True,
         ),
     ],
 )
-
 
 @callback(
     Output("navbar-collapse", "is_open"),
@@ -350,6 +589,8 @@ def catch_all(path):
     # Let Dash/Flask handle its own special routes.
     if path.startswith("_dash-") or path.startswith("assets/") or path.startswith("_favicon"):
         return ("Not Found", 404)
+    if path == "explore":
+        return redirect("/experiment")
     return app.index()
 
 
@@ -363,11 +604,85 @@ def about_page() -> html.Div:
             dbc.Card(
                 dbc.CardBody(
                     [
-                        html.H2("Overview", className="mb-2"),
-                        html.P(
-                            "This project simulates repeated Prisoner’s Dilemma tournaments across multiple strategies, "
-                            "then lets you explore outcomes, behavior, and tradeoffs interactively.",
-                            className="muted",
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    [
+                                        html.H2("Prisoner’s Dilemma Simulation", className="mb-2"),
+                                        html.P(
+                                            "Explore how cooperation (and exploitation) emerges in repeated interactions. "
+                                            "Run tournaments, inspect behavior round-by-round, and compare strategies under "
+                                            "reproducible settings.",
+                                            className="muted",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    dbc.Button(
+                                                        "Open Experiment",
+                                                        href="/experiment",
+                                                        color="primary",
+                                                        size="lg",
+                                                        className="w-100",
+                                                    ),
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    dbc.Button(
+                                                        "Open Profiles",
+                                                        href="/profiles",
+                                                        color="secondary",
+                                                        size="lg",
+                                                        className="w-100",
+                                                    ),
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-2 mt-2",
+                                        ),
+                                    ],
+                                    md=7,
+                                ),
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Payoff matrix (per round)", className="mb-2"),
+                                                dbc.Table(
+                                                    [
+                                                        html.Thead(
+                                                            html.Tr(
+                                                                [
+                                                                    html.Th("You \\ Opponent"),
+                                                                    html.Th("Cooperate"),
+                                                                    html.Th("Defect"),
+                                                                ]
+                                                            )
+                                                        ),
+                                                        html.Tbody(
+                                                            [
+                                                                html.Tr([html.Th("Cooperate"), html.Td("3 , 3"), html.Td("0 , 5")]),
+                                                                html.Tr([html.Th("Defect"), html.Td("5 , 0"), html.Td("1 , 1")]),
+                                                            ]
+                                                        ),
+                                                    ],
+                                                    bordered=True,
+                                                    responsive=True,
+                                                    size="sm",
+                                                    className="mb-0",
+                                                ),
+                                                html.Div(
+                                                    "In a single round, defection dominates. Over many rounds, reputation and reciprocity can make cooperation viable.",
+                                                    className="muted mt-2",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=5,
+                                ),
+                            ],
+                            className="g-3 align-items-stretch",
                         ),
                         html.Hr(),
                         dbc.Row(
@@ -376,48 +691,197 @@ def about_page() -> html.Div:
                                     dbc.Card(
                                         dbc.CardBody(
                                             [
-                                                html.H5("Purpose"),
-                                                html.P(
-                                                    "Understand how strategy design affects cooperation, retaliation, and long-run payoffs.",
-                                                    className="muted",
-                                                ),
-                                            ]
-                                        ),
-                                        className="glass-card",
-                                    ),
-                                    md=4,
-                                ),
-                                dbc.Col(
-                                    dbc.Card(
-                                        dbc.CardBody(
-                                            [
-                                                html.H5("Value"),
-                                                html.P(
-                                                    "Compare strategies with reproducible runs (seeded) and see where each one wins/loses.",
-                                                    className="muted",
-                                                ),
-                                            ]
-                                        ),
-                                        className="glass-card",
-                                    ),
-                                    md=4,
-                                ),
-                                dbc.Col(
-                                    dbc.Card(
-                                        dbc.CardBody(
-                                            [
-                                                html.H5("Try it"),
-                                                html.Div(
+                                                html.H5("What you can do", className="mb-2"),
+                                                html.Ul(
                                                     [
-                                                        dbc.Button("Explore results", href="/explore", color="primary", className="me-2"),
-                                                        dbc.Button("Run an experiment", href="/experiment", color="success", outline=True),
-                                                    ]
+                                                        html.Li([html.Strong("Tournament (live): "), "Watch scores and win/loss trends update in real time."]),
+                                                        html.Li([html.Strong("Play a match: "), "Make your own moves against any strategy and see the outcome unfold."]),
+                                                        html.Li([html.Strong("Profiles & comparisons: "), "Inspect behavior patterns and head‑to‑head results."]),
+                                                        html.Li([html.Strong("Build a strategy: "), "Create rule-based custom strategies and test them in tournaments."]),
+                                                    ],
+                                                    className="muted mb-0",
                                                 ),
                                             ]
                                         ),
                                         className="glass-card",
                                     ),
-                                    md=4,
+                                    md=6,
+                                ),
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Key ideas to watch", className="mb-2"),
+                                                html.Ul(
+                                                    [
+                                                        html.Li([html.Strong("Reciprocity: "), "Does a strategy reward cooperation and punish defection?"]),
+                                                        html.Li([html.Strong("Forgiveness: "), "Can it return to cooperation after conflict?"]),
+                                                        html.Li([html.Strong("Robustness: "), "Does it resist being exploited by defect-heavy opponents?"]),
+                                                        html.Li([html.Strong("Stability: "), "Does its performance hold across seeds and settings?"]),
+                                                    ],
+                                                    className="muted mb-0",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=6,
+                                ),
+                            ],
+                            className="g-3",
+                        ),
+                        html.Br(),
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Background (why this game matters)", className="mb-2"),
+                                                html.P(
+                                                    "The Prisoner’s Dilemma models a tension between short‑term incentives and long‑term outcomes. "
+                                                    "In a single round, defection is the dominant action (it never does worse immediately). "
+                                                    "But in repeated interactions, strategies can build (or destroy) cooperation through "
+                                                    "reciprocity, punishment, forgiveness, and reputation-like dynamics.",
+                                                    className="muted mb-2",
+                                                ),
+                                                html.P(
+                                                    "This is why Iterated Prisoner’s Dilemma became a classic testbed in game theory and evolutionary thinking: "
+                                                    "it’s a simple rule set that still produces rich, surprising behavior.",
+                                                    className="muted mb-0",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=6,
+                                ),
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("How this simulator works", className="mb-2"),
+                                                html.Ul(
+                                                    [
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("A match"),
+                                                                ": two strategies play for N rounds. Each round awards points using the payoff matrix above.",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("A tournament"),
+                                                                ": every selected strategy plays every other strategy (round‑robin).",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Repetitions"),
+                                                                ": the same pairing is repeated multiple times to reduce randomness/noise and estimate typical outcomes.",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Live mode"),
+                                                                ": the app advances the tournament in small steps so charts update while it runs.",
+                                                            ]
+                                                        ),
+                                                    ],
+                                                    className="muted mb-0",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=6,
+                                ),
+                            ],
+                            className="g-3",
+                        ),
+                        html.Br(),
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Settings (what they change)", className="mb-2"),
+                                                html.Ul(
+                                                    [
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Rounds per match"),
+                                                                ": longer matches give more time for retaliation and forgiveness to matter.",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Repetitions"),
+                                                                ": more repeats make results smoother and less dependent on luck.",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Random seed"),
+                                                                ": makes stochastic behavior reproducible. If you change the seed, you’ll often see different outcomes.",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Known match length"),
+                                                                ": when on, strategies may know the total number of rounds (enabling end‑game behavior). "
+                                                                "When off, strategies don’t get that information, which can make cooperation more stable.",
+                                                            ]
+                                                        ),
+                                                    ],
+                                                    className="muted mb-0",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=6,
+                                ),
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("How to interpret results", className="mb-2"),
+                                                html.Ul(
+                                                    [
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Total points ≠ 'niceness'"),
+                                                                ": defect-heavy strategies can score well in some fields, but often collapse into low mutual scores.",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Win/loss vs points"),
+                                                                ": a strategy can win many matches but still have a lower average payoff (or vice versa).",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Stability"),
+                                                                ": try multiple seeds and settings. A strategy that only wins under one seed is less convincing.",
+                                                            ]
+                                                        ),
+                                                        html.Li(
+                                                            [
+                                                                html.Strong("Head‑to‑head"),
+                                                                ": use Profiles to see who a strategy beats/loses to and whether it changes behavior over time.",
+                                                            ]
+                                                        ),
+                                                    ],
+                                                    className="muted mb-0",
+                                                ),
+                                            ]
+                                        ),
+                                        className="glass-card",
+                                    ),
+                                    md=6,
                                 ),
                             ],
                             className="g-3",
@@ -438,16 +902,45 @@ def about_page() -> html.Div:
                                 ),
                                 html.Li(
                                     [
-                                        html.Strong("Axelrod tournaments: "),
-                                        html.Span("classic repeated PD strategy competition (Tit-for-Tat and others)"),
+                                        html.Strong("Axelrod tournaments (Iterated PD): "),
+                                        html.A(
+                                            "Axelrod-Python tournament library",
+                                            href="https://axelrod.readthedocs.io/en/stable/",
+                                            target="_blank",
+                                        ),
+                                    ]
+                                ),
+                                html.Li(
+                                    [
+                                        html.Strong("Axelrod (Science, 1981): "),
+                                        html.A(
+                                            "The Evolution of Cooperation",
+                                            href="https://doi.org/10.1126/science.7466396",
+                                            target="_blank",
+                                        ),
+                                    ]
+                                ),
+                                html.Li(
+                                    [
+                                        html.Strong("Press & Dyson (PNAS, 2012): "),
+                                        html.A(
+                                            "Iterated Prisoner’s Dilemma contains strategies that dominate any evolutionary opponent",
+                                            href="https://doi.org/10.1073/pnas.1206569109",
+                                            target="_blank",
+                                        ),
+                                    ]
+                                ),
+                                html.Li(
+                                    [
+                                        html.Strong("Nowak (Science, 2006): "),
+                                        html.A(
+                                            "Five Rules for the Evolution of Cooperation",
+                                            href="https://doi.org/10.1126/science.1133755",
+                                            target="_blank",
+                                        ),
                                     ]
                                 ),
                             ],
-                            className="muted",
-                        ),
-                        html.Hr(),
-                        html.P(
-                            "Tip: use the left panel to adjust rounds/repetitions/seed for the Explore and Profiles pages.",
                             className="muted",
                         ),
                     ]
@@ -491,8 +984,8 @@ def donate_page() -> html.Div:
     )
 
 
-def explore_page(rounds_per_match: int, repetitions: int, seed: int) -> html.Div:
-    df = get_results(rounds_per_match, repetitions, seed)
+def explore_page(rounds_per_match: int, repetitions: int, seed: int, horizon_known: bool) -> html.Div:
+    df = get_results(rounds_per_match, repetitions, seed, horizon_known)
     summary = strategy_summary(df)
 
     fig = px.bar(
@@ -697,8 +1190,9 @@ def profiles_page() -> html.Div:
             html.Br(),
             dbc.Row(
                 [
-                    dbc.Col(dbc.Card(dbc.CardBody(html.Div(id="profile-metadata"))), md=6),
-                    dbc.Col(dbc.Card(dbc.CardBody(html.Div(id="profile-kpis"))), md=6),
+                    dbc.Col(dbc.Card(dbc.CardBody(html.Div(id="profile-metadata")), className="glass-card"), md=4),
+                    dbc.Col(dbc.Card(dbc.CardBody(html.Div(id="profile-kpis")), className="glass-card"), md=4),
+                    dbc.Col(dbc.Card(dbc.CardBody(html.Div(id="profile-scorecard")), className="glass-card"), md=4),
                 ],
                 className="g-3",
             ),
@@ -738,13 +1232,61 @@ def profiles_page() -> html.Div:
                     "border": "1px solid var(--card-border)",
                 },
             ),
+            html.Hr(),
+            html.H3("Compare two strategies"),
+            html.P("Compare head-to-head results and behaviors side-by-side.", className="muted"),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            dbc.Label("Strategy A"),
+                            dcc.Dropdown(
+                                id="compare-a",
+                                options=[{"label": n, "value": n} for n in names],
+                                value=names[0] if names else None,
+                                clearable=False,
+                            ),
+                        ],
+                        md=6,
+                    ),
+                    dbc.Col(
+                        [
+                            dbc.Label("Strategy B"),
+                            dcc.Dropdown(
+                                id="compare-b",
+                                options=[{"label": n, "value": n} for n in names],
+                                value=names[1] if len(names) > 1 else (names[0] if names else None),
+                                clearable=False,
+                            ),
+                        ],
+                        md=6,
+                    ),
+                ],
+                className="g-2",
+            ),
+            html.Br(),
+            dbc.Row([dbc.Col(dcc.Graph(id="compare-headtohead"), md=12)], className="g-3"),
+            dbc.Row(
+                [
+                    dbc.Col(dcc.Graph(id="compare-a-vs-opponents"), md=6),
+                    dbc.Col(dcc.Graph(id="compare-b-vs-opponents"), md=6),
+                ],
+                className="g-3",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(dcc.Graph(id="compare-a-behavior"), md=6),
+                    dbc.Col(dcc.Graph(id="compare-b-behavior"), md=6),
+                ],
+                className="g-3",
+            ),
         ]
     )
 
 
 def experiment_page() -> html.Div:
     names = list_strategy_names()
-    default_names = names
+    default_names = names[:10]
 
     return html.Div(
         [
@@ -768,6 +1310,11 @@ def experiment_page() -> html.Div:
                                     tab_id="tab-tournament",
                                     children=[
                                         html.Br(),
+                                        dbc.Alert(
+                                            "For performance and clarity, tournaments are limited to 10 strategies per run.",
+                                            color="info",
+                                            className="mb-3",
+                                        ),
                                         dbc.Modal(
                                             [
                                                 dbc.ModalHeader(dbc.ModalTitle("Tournament summary")),
@@ -792,7 +1339,12 @@ def experiment_page() -> html.Div:
                                             [
                                                 dbc.Col(
                                                     [
-                                                        dbc.Label("Strategies"),
+                                                        label_with_help(
+                                                            "Strategies",
+                                                            "help-tournament-strategies",
+                                                            "Select up to 10 strategies for a live tournament run. "
+                                                            "Reducing the number of strategies makes the live runner faster and easier to interpret.",
+                                                        ),
                                                         dcc.Dropdown(
                                                             id="tournament-strategies",
                                                             options=[{"label": n, "value": n} for n in names],
@@ -804,15 +1356,24 @@ def experiment_page() -> html.Div:
                                                 ),
                                                 dbc.Col(
                                                     [
-                                                        dbc.Label("Rounds per match"),
-                                                        dbc.Input(id="tournament-rounds", type="number", value=10, min=1, step=1),
+                                                        label_with_help(
+                                                            "Rounds per match",
+                                                            "help-tournament-rounds",
+                                                            "How many rounds each pair of strategies plays per match. "
+                                                            "Higher values reduce randomness but increase runtime.",
+                                                        ),
+                                                        dbc.Input(id="tournament-rounds", type="number", value=10, min=5, max=20, step=1),
                                                     ],
                                                     md=3,
                                                 ),
                                                 dbc.Col(
                                                     [
-                                                        dbc.Label("Repetitions"),
-                                                        dbc.Input(id="tournament-reps", type="number", value=20, min=1, step=1),
+                                                        label_with_help(
+                                                            "Repetitions",
+                                                            "help-tournament-reps",
+                                                            "How many times each pairing is repeated. Higher values stabilize rankings but increase runtime.",
+                                                        ),
+                                                        dbc.Input(id="tournament-reps", type="number", value=10, min=1, max=30, step=1),
                                                     ],
                                                     md=3,
                                                 ),
@@ -824,10 +1385,30 @@ def experiment_page() -> html.Div:
                                             [
                                                 dbc.Col(
                                                     [
-                                                        dbc.Label("Seed"),
+                                                        label_with_help(
+                                                            "Seed",
+                                                            "help-tournament-seed",
+                                                            "Controls randomness for reproducibility. Same seed + same settings should produce the same results.",
+                                                        ),
                                                         dbc.Input(id="tournament-seed", type="number", value=0, step=1),
                                                     ],
                                                     md=3,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        label_with_help(
+                                                            "Match length visibility",
+                                                            "help-tournament-horizon-known",
+                                                            "If enabled, strategies are treated as knowing the match length (N). "
+                                                            "This can change endgame-style strategies that behave differently on the final turn.",
+                                                        ),
+                                                        dbc.Switch(
+                                                            id="tournament-horizon-known",
+                                                            value=True,
+                                                            label="Strategies know the number of rounds",
+                                                        ),
+                                                    ],
+                                                    md=5,
                                                 ),
                                                 dbc.Col(
                                                     [
@@ -1143,17 +1724,15 @@ def experiment_page() -> html.Div:
 @callback(
     Output("page-content", "children"),
     Input("url", "pathname"),
-    Input("rounds-per-match", "value"),
-    Input("repetitions", "value"),
-    Input("seed", "value"),
 )
-def display_page(pathname: str, rounds_per_match: int, repetitions: int, seed: int):
+def display_page(pathname: str):
     if pathname == "/profiles":
         return profiles_page()
     if pathname == "/experiment":
         return experiment_page()
     if pathname == "/explore":
-        return explore_page(rounds_per_match, repetitions, int(seed or 0))
+        # Backwards-compat deep link: redirect to Experiment.
+        return html.Div([dcc.Location(id="redirect-explore", href="/experiment")])
     if pathname == "/donate":
         return donate_page()
     # default: about/overview
@@ -1168,23 +1747,26 @@ def display_page(pathname: str, rounds_per_match: int, repetitions: int, seed: i
 @callback(
     Output("profile-metadata", "children"),
     Output("profile-kpis", "children"),
+    Output("profile-scorecard", "children"),
     Output("profile-vs-opponents", "figure"),
     Output("profile-round-behavior", "figure"),
     Output("profile-opponent-table", "columns"),
     Output("profile-opponent-table", "data"),
     Input("profile-strategy", "value"),
-    Input("rounds-per-match", "value"),
-    Input("repetitions", "value"),
-    Input("seed", "value"),
+    Input("sim-settings", "data"),
 )
-def update_profile(strategy: str, rounds_per_match: int, repetitions: int, seed: int):
-    seed = int(seed or 0)
-    df = get_results(rounds_per_match, repetitions, seed)
+def update_profile(strategy: str, sim_settings: dict):
+    sim_settings = dict(sim_settings or {})
+    rounds_per_match = int(sim_settings.get("rounds_per_match", 10) or 10)
+    repetitions = int(sim_settings.get("repetitions", 10) or 10)
+    seed = int(sim_settings.get("seed", 0) or 0)
+    horizon_known = bool(sim_settings.get("horizon_known", True))
+    df = get_results(rounds_per_match, repetitions, seed, horizon_known)
     persp = perspective_rows(df)
 
     if not strategy:
         empty_fig = px.scatter(title="No strategy selected")
-        return "No strategy selected.", "", empty_fig, empty_fig, [], []
+        return "No strategy selected.", "", "", empty_fig, empty_fig, [], []
 
     profile = STRATEGY_PROFILES.get(strategy, {})
 
@@ -1202,7 +1784,7 @@ def update_profile(strategy: str, rounds_per_match: int, repetitions: int, seed:
     s_rows = persp[persp["strategy"] == strategy].copy()
     if s_rows.empty:
         empty_fig = px.scatter(title="No data for selected strategy")
-        return meta, "", empty_fig, empty_fig, [], []
+        return meta, "", "", empty_fig, empty_fig, [], []
 
     coop_rate = float((s_rows["move"] == "cooperate").mean())
     avg_points = float(s_rows["points"].mean())
@@ -1219,6 +1801,46 @@ def update_profile(strategy: str, rounds_per_match: int, repetitions: int, seed:
             dbc.Col(dbc.Card(dbc.CardBody([html.H6("Cooperate rate"), html.H3(f"{coop_rate*100:.1f}%")]))),
         ],
         className="g-2",
+    )
+
+    # --- Scorecard (simple classification) ---
+    tags = strategy_scorecard(strategy)
+
+    primarily_coop = coop_rate >= (2.0 / 3.0)
+    primarily_def = coop_rate <= (1.0 / 3.0)
+
+    def _bubble(v: bool) -> html.Span:
+        return html.Span(
+            "✓" if v else "×",
+            className=("score-bubble score-bubble-yes" if v else "score-bubble score-bubble-no"),
+        )
+
+    def _pill(label: str, v: bool) -> html.Div:
+        return html.Div([html.Span(label, className="score-label"), _bubble(v)], className="score-pill")
+
+    memory_label = str(tags.get("memory", "unknown"))
+    scorecard = html.Div(
+        [
+            html.Div(
+                [
+                    html.H5("Scorecard", className="mb-0"),
+                    dbc.Badge(f"Memory: {memory_label}", color="secondary", pill=True, className="ms-auto"),
+                ],
+                className="d-flex align-items-center justify-content-between mb-2",
+            ),
+            html.Div(
+                [
+                    _pill("Primarily cooperative", primarily_coop),
+                    _pill("Primarily defective", primarily_def),
+                    _pill("Deterministic", bool(tags.get("deterministic"))),
+                    _pill("Stochastic", bool(tags.get("stochastic"))),
+                    _pill("Reactive", bool(tags.get("reactive"))),
+                    _pill("Time-based", bool(tags.get("time_based"))),
+                ],
+                className="scorecard-grid",
+            ),
+            html.Div("Some labels are heuristic / run-dependent.", className="muted mt-2"),
+        ]
     )
 
     vs = (
@@ -1271,7 +1893,122 @@ def update_profile(strategy: str, rounds_per_match: int, repetitions: int, seed:
     columns = [{"name": c, "id": c} for c in vs.columns]
     data = vs.round(4).to_dict("records")
 
-    return meta, kpis, vs_fig, round_fig, columns, data
+    return meta, kpis, scorecard, vs_fig, round_fig, columns, data
+
+
+@callback(
+    Output("compare-headtohead", "figure"),
+    Output("compare-a-vs-opponents", "figure"),
+    Output("compare-b-vs-opponents", "figure"),
+    Output("compare-a-behavior", "figure"),
+    Output("compare-b-behavior", "figure"),
+    Input("compare-a", "value"),
+    Input("compare-b", "value"),
+    Input("sim-settings", "data"),
+)
+def compare_strategies(a: str, b: str, sim_settings: dict):
+    sim_settings = dict(sim_settings or {})
+    rounds_per_match = int(sim_settings.get("rounds_per_match", 10) or 10)
+    repetitions = int(sim_settings.get("repetitions", 10) or 10)
+    seed = int(sim_settings.get("seed", 0) or 0)
+    horizon_known = bool(sim_settings.get("horizon_known", True))
+
+    a = str(a or "")
+    b = str(b or "")
+
+    df = get_results(rounds_per_match, repetitions, seed, horizon_known)
+    persp = perspective_rows(df)
+
+    empty = px.scatter(title="Select two strategies to compare")
+    empty.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+
+    if not a or not b or a == b or persp.empty:
+        return empty, empty, empty, empty, empty
+
+    # --- Head-to-head (match-level) ---
+    m = match_level(persp)
+    ab = m[(m["strategy"] == a) & (m["opponent"] == b)].copy()
+    ba = m[(m["strategy"] == b) & (m["opponent"] == a)].copy()
+
+    def summarize_head(dfm: pd.DataFrame, label: str) -> dict:
+        if dfm.empty:
+            return {"pair": label, "avg_points": 0.0, "win_rate": 0.0, "loss_rate": 0.0, "tie_rate": 0.0}
+        win = float((dfm["outcome"] == "win").mean())
+        loss = float((dfm["outcome"] == "loss").mean())
+        tie = float((dfm["outcome"] == "tie").mean())
+        avg_pts = float((dfm["points"] / dfm["rounds"].where(dfm["rounds"] != 0, 1)).mean())
+        return {"pair": label, "avg_points": avg_pts, "win_rate": win, "loss_rate": loss, "tie_rate": tie}
+
+    head_rows = [
+        summarize_head(ab, f"{a} vs {b}"),
+        summarize_head(ba, f"{b} vs {a}"),
+    ]
+    head_df = pd.DataFrame(head_rows)
+
+    head = make_subplots(rows=1, cols=2, subplot_titles=("Avg points / round", "Win / loss / tie rates"))
+    head.add_trace(go.Bar(x=head_df["pair"], y=head_df["avg_points"], name="Avg points/round"), row=1, col=1)
+
+    head.add_trace(go.Bar(x=head_df["pair"], y=head_df["win_rate"], name="Win rate"), row=1, col=2)
+    head.add_trace(go.Bar(x=head_df["pair"], y=head_df["loss_rate"], name="Loss rate"), row=1, col=2)
+    head.add_trace(go.Bar(x=head_df["pair"], y=head_df["tie_rate"], name="Tie rate"), row=1, col=2)
+
+    head.update_layout(
+        title=f"Head-to-head summary (seed={seed})",
+        height=420,
+        margin=dict(l=10, r=10, t=70, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        barmode="group",
+        legend_orientation="h",
+        legend_y=-0.15,
+    )
+    head.update_yaxes(title_text="Points/round", row=1, col=1)
+    head.update_yaxes(title_text="Rate", range=[0, 1], row=1, col=2)
+
+    # --- Vs opponents (side-by-side) ---
+    def vs_opponents_fig(strategy: str) -> go.Figure:
+        s_rows = persp[persp["strategy"] == strategy].copy()
+        vs = (
+            s_rows.groupby("opponent", as_index=False)
+            .agg(avg_points_per_round=("points", "mean"), cooperate_rate=("move", lambda s: float((s == "cooperate").mean())))
+            .sort_values("avg_points_per_round", ascending=True)
+        )
+        fig = px.bar(
+            vs,
+            x="avg_points_per_round",
+            y="opponent",
+            orientation="h",
+            title=f"{strategy}: avg points/round vs opponents",
+        )
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        return fig
+
+    # --- Behavior by round (dual axis) ---
+    def behavior_fig(strategy: str) -> go.Figure:
+        s_rows = persp[persp["strategy"] == strategy].copy()
+        by_round = (
+            s_rows.groupby("round", as_index=False)
+            .agg(cooperate_rate=("move", lambda s: float((s == "cooperate").mean())), avg_points=("points", lambda s: float(s.mean())))
+        )
+        by_round["round"] = by_round["round"] + 1
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Scatter(x=by_round["round"], y=by_round["cooperate_rate"], name="Cooperate rate", mode="lines+markers"), secondary_y=False)
+        fig.add_trace(go.Scatter(x=by_round["round"], y=by_round["avg_points"], name="Avg points", mode="lines+markers"), secondary_y=True)
+        fig.update_layout(
+            title=f"{strategy}: behavior by round",
+            height=420,
+            margin=dict(l=10, r=10, t=60, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend_orientation="h",
+            legend_y=-0.18,
+        )
+        fig.update_xaxes(title_text="Round")
+        fig.update_yaxes(title_text="Cooperate rate", range=[0, 1], secondary_y=False)
+        fig.update_yaxes(title_text="Avg points", secondary_y=True)
+        return fig
+
+    return head, vs_opponents_fig(a), vs_opponents_fig(b), behavior_fig(a), behavior_fig(b)
 
 
 @callback(
@@ -1280,19 +2017,19 @@ def update_profile(strategy: str, rounds_per_match: int, repetitions: int, seed:
     Input("profile-export-png", "n_clicks"),
     Input("profile-export-pdf", "n_clicks"),
     State("profile-strategy", "value"),
-    State("rounds-per-match", "value"),
-    State("repetitions", "value"),
-    State("seed", "value"),
+    State("sim-settings", "data"),
     prevent_initial_call=True,
 )
-def export_profile(_csv, _png, _pdf, strategy: str, rounds_per_match: int, repetitions: int, seed: int):
+def export_profile(_csv, _png, _pdf, strategy: str, sim_settings: dict):
     triggered = dash.ctx.triggered_id
     strategy = str(strategy or "strategy")
-    rounds_per_match = int(rounds_per_match or 10)
-    repetitions = int(repetitions or 30)
-    seed = int(seed or 0)
+    sim_settings = dict(sim_settings or {})
+    rounds_per_match = int(sim_settings.get("rounds_per_match", 10) or 10)
+    repetitions = int(sim_settings.get("repetitions", 10) or 10)
+    seed = int(sim_settings.get("seed", 0) or 0)
+    horizon_known = bool(sim_settings.get("horizon_known", True))
 
-    df = get_results(rounds_per_match, repetitions, seed)
+    df = get_results(rounds_per_match, repetitions, seed, horizon_known)
     persp = perspective_rows(df)
     s_rows = persp[persp["strategy"] == strategy].copy()
 
@@ -1381,18 +2118,18 @@ def export_profile(_csv, _png, _pdf, strategy: str, rounds_per_match: int, repet
     Input("explore-export-csv", "n_clicks"),
     Input("explore-export-png", "n_clicks"),
     Input("explore-export-pdf", "n_clicks"),
-    State("rounds-per-match", "value"),
-    State("repetitions", "value"),
-    State("seed", "value"),
+    State("sim-settings", "data"),
     prevent_initial_call=True,
 )
-def export_explore(_csv, _png, _pdf, rounds_per_match: int, repetitions: int, seed: int):
+def export_explore(_csv, _png, _pdf, sim_settings: dict):
     triggered = dash.ctx.triggered_id
-    rounds_per_match = int(rounds_per_match or 10)
-    repetitions = int(repetitions or 30)
-    seed = int(seed or 0)
+    sim_settings = dict(sim_settings or {})
+    rounds_per_match = int(sim_settings.get("rounds_per_match", 10) or 10)
+    repetitions = int(sim_settings.get("repetitions", 10) or 10)
+    seed = int(sim_settings.get("seed", 0) or 0)
+    horizon_known = bool(sim_settings.get("horizon_known", True))
 
-    df = get_results(rounds_per_match, repetitions, seed)
+    df = get_results(rounds_per_match, repetitions, seed, horizon_known)
     summary = strategy_summary(df)
 
     if triggered == "explore-export-csv":
@@ -1426,6 +2163,26 @@ def export_explore(_csv, _png, _pdf, rounds_per_match: int, repetitions: int, se
 
 
 @callback(
+    Output("sim-settings", "data"),
+    Input("tournament-rounds", "value"),
+    Input("tournament-reps", "value"),
+    Input("tournament-seed", "value"),
+    Input("tournament-horizon-known", "value"),
+    State("sim-settings", "data"),
+)
+def sync_sim_settings(rounds, reps, seed, horizon_known, current):
+    current = dict(current or {})
+    if rounds is not None:
+        current["rounds_per_match"] = int(rounds)
+    if reps is not None:
+        current["repetitions"] = int(reps)
+    if seed is not None:
+        current["seed"] = int(seed)
+    current["horizon_known"] = bool(horizon_known)
+    return current
+
+
+@callback(
     Output("tournament-state", "data"),
     Output("tournament-interval", "disabled"),
     Output("tournament-status", "children"),
@@ -1449,9 +2206,10 @@ def export_explore(_csv, _png, _pdf, rounds_per_match: int, repetitions: int, se
     State("tournament-reps", "value"),
     State("tournament-seed", "value"),
     State("custom-strategies", "data"),
+    State("tournament-horizon-known", "value"),
     State("tournament-state", "data"),
 )
-def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds, reps, seed, custom_strategies, state):
+def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds, reps, seed, custom_strategies, horizon_known, state):
 
     def _summary_children(current_state: dict) -> html.Div:
         names = list(current_state.get("strategy_names", []))
@@ -1700,7 +2458,10 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             rpm = int(current_state.get("rounds_per_match", 0))
             rep = int(current_state.get("rep", 0))
             reps_total = int(current_state.get("repetitions", 0))
-            status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r}/{rpm})"
+            if bool(current_state.get("horizon_known", True)):
+                status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r}/{rpm})"
+            else:
+                status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r})"
 
         # Modal: show summary once, when the tournament completes
         modal_open = False
@@ -1740,12 +2501,22 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
 
     if triggered == "tournament-start":
         try:
+            chosen = list(strategies or [])
+            if not chosen:
+                return _render(state, True, "Select at least 1 strategy to start.")
+            if len(chosen) > 10:
+                return _render(
+                    state,
+                    True,
+                    "Select up to 10 strategies (limit for performance and clarity).",
+                )
             custom_map = {s["name"]: s["config"] for s in (custom_strategies or []) if isinstance(s, dict) and "name" in s and "config" in s}
             state = init_tournament_state(
-                strategy_names=list(strategies or []),
+                strategy_names=chosen,
                 rounds_per_match=int(rounds or 10),
                 repetitions=int(reps or 10),
                 seed=int(seed or 0),
+                horizon_known=bool(horizon_known),
                 custom_strategies=custom_map,
             )
         except Exception as e:
@@ -1793,11 +2564,12 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
     State("human-opponent", "value"),
     State("human-rounds", "value"),
     State("human-seed", "value"),
+    State("sim-settings", "data"),
     State("custom-strategies", "data"),
     State("human-match-state", "data"),
     prevent_initial_call=True,
 )
-def play_human(new, coop, defect, reset, opponent, rounds, seed, custom_strategies, state):
+def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, custom_strategies, state):
     triggered = dash.ctx.triggered_id
 
     if triggered == "human-reset":
@@ -1806,11 +2578,13 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, custom_strategi
 
     if triggered == "human-new":
         try:
+            horizon_known = bool((sim_settings or {}).get("horizon_known", True))
             custom_map = {s["name"]: s["config"] for s in (custom_strategies or []) if isinstance(s, dict) and "name" in s and "config" in s}
             state = init_human_match_state(
                 opponent=str(opponent),
                 rounds=int(rounds or 10),
                 seed=int(seed or 0),
+                horizon_known=bool(horizon_known),
                 custom_strategies=custom_map,
             )
         except Exception as e:
@@ -1833,7 +2607,10 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, custom_strategi
     total_r = int(state.get("rounds", 0))
     done = bool(state.get("done"))
 
-    status = f"Round {r}/{total_r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
+    if bool(state.get("horizon_known", True)):
+        status = f"Round {r}/{total_r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
+    else:
+        status = f"Round {r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
     if done:
         status += " — Finished."
 
