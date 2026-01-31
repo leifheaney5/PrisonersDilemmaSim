@@ -162,4 +162,58 @@ textarea:focus {
   border-color: var(--card-border) !important;
 }
 
+/* Button rows (wrap nicely on mobile) */
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* Tabs: allow horizontal scroll on small screens */
+@media (max-width: 576px) {
+  .nav-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+  .nav-tabs .nav-link {
+    white-space: nowrap;
+  }
+}
+
+/* Mobile-first polish */
+@media (max-width: 576px) {
+  /* Reduce overall padding density */
+  .card-body {
+    padding: 0.95rem;
+  }
+
+  /* Navbar: make collapsed actions easy to tap */
+  .app-navbar .navbar-collapse .nav-item,
+  .app-navbar .navbar-collapse .nav-link,
+  .app-navbar .navbar-collapse .btn {
+    width: 100%;
+  }
+  .app-navbar .navbar-collapse .btn {
+    justify-content: center;
+  }
+
+  /* Stack action buttons vertically (big touch targets) */
+  .btn-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .btn-row .btn {
+    width: 100%;
+  }
+
+  /* Tables: better horizontal swipe behavior */
+  .dash-table-container,
+  .dash-table-container .dash-spreadsheet-container {
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
 

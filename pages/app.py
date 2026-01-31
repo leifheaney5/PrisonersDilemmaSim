@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 from functools import lru_cache
 from pathlib import Path
+import random
 
 import dash
 from dash import Input, Output, State, callback, dcc, html, dash_table
@@ -504,6 +505,8 @@ def navbar_links() -> list[dbc.NavLink]:
 
 
 pio.templates.default = "plotly_white"
+
+GRAPH_CONFIG = {"displayModeBar": False, "responsive": True}
 
 app.layout = html.Div(
     id="app-shell",
@@ -1199,14 +1202,14 @@ def profiles_page() -> html.Div:
             html.Br(),
             dbc.Row(
                 [
-                    dbc.Col(dcc.Graph(id="profile-vs-opponents"), md=12),
+                    dbc.Col(dcc.Graph(id="profile-vs-opponents", config=GRAPH_CONFIG), md=12),
                 ],
                 className="g-3",
             ),
             html.Br(),
             dbc.Row(
                 [
-                    dbc.Col(dcc.Graph(id="profile-round-behavior"), md=12),
+                    dbc.Col(dcc.Graph(id="profile-round-behavior", config=GRAPH_CONFIG), md=12),
                 ],
                 className="g-3",
             ),
@@ -1265,18 +1268,18 @@ def profiles_page() -> html.Div:
                 className="g-2",
             ),
             html.Br(),
-            dbc.Row([dbc.Col(dcc.Graph(id="compare-headtohead"), md=12)], className="g-3"),
+            dbc.Row([dbc.Col(dcc.Graph(id="compare-headtohead", config=GRAPH_CONFIG), md=12)], className="g-3"),
             dbc.Row(
                 [
-                    dbc.Col(dcc.Graph(id="compare-a-vs-opponents"), md=6),
-                    dbc.Col(dcc.Graph(id="compare-b-vs-opponents"), md=6),
+                    dbc.Col(dcc.Graph(id="compare-a-vs-opponents", config=GRAPH_CONFIG), md=6),
+                    dbc.Col(dcc.Graph(id="compare-b-vs-opponents", config=GRAPH_CONFIG), md=6),
                 ],
                 className="g-3",
             ),
             dbc.Row(
                 [
-                    dbc.Col(dcc.Graph(id="compare-a-behavior"), md=6),
-                    dbc.Col(dcc.Graph(id="compare-b-behavior"), md=6),
+                    dbc.Col(dcc.Graph(id="compare-a-behavior", config=GRAPH_CONFIG), md=6),
+                    dbc.Col(dcc.Graph(id="compare-b-behavior", config=GRAPH_CONFIG), md=6),
                 ],
                 className="g-3",
             ),
@@ -1311,7 +1314,9 @@ def experiment_page() -> html.Div:
                                     children=[
                                         html.Br(),
                                         dbc.Alert(
-                                            "For performance and clarity, tournaments are limited to 10 strategies per run.",
+                                        "Tip: tournaments grow quadratically with strategy count (N×(N−1)/2 matchups). "
+                                        "This app now uses compact state + throttled chart updates so you can run larger sets, "
+                                        "but very large runs may still take time (especially on Render free tier).",
                                             color="info",
                                             className="mb-3",
                                         ),
@@ -1350,6 +1355,19 @@ def experiment_page() -> html.Div:
                                                             options=[{"label": n, "value": n} for n in names],
                                                             value=default_names,
                                                             multi=True,
+                                                        ),
+                                                        html.Div(
+                                                            [
+                                                                dbc.Button(
+                                                                    "Random 10",
+                                                                    id="tournament-random-10",
+                                                                    color="secondary",
+                                                                    outline=True,
+                                                                    size="sm",
+                                                                ),
+                                                                html.Div(id="tournament-random-feedback", className="muted"),
+                                                            ],
+                                                            className="d-flex align-items-center gap-2 mt-2 flex-wrap",
                                                         ),
                                                     ],
                                                     md=6,
@@ -1412,9 +1430,14 @@ def experiment_page() -> html.Div:
                                                 ),
                                                 dbc.Col(
                                                     [
-                                                        dbc.Button("Start", id="tournament-start", color="success", className="me-2"),
-                                                        dbc.Button("Stop", id="tournament-stop", color="secondary", outline=True, className="me-2"),
-                                                        dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
+                                                        html.Div(
+                                                            [
+                                                                dbc.Button("Start", id="tournament-start", color="success"),
+                                                                dbc.Button("Stop", id="tournament-stop", color="secondary", outline=True),
+                                                                dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
+                                                            ],
+                                                            className="btn-row",
+                                                        ),
                                                     ],
                                                     md=9,
                                                     className="d-flex align-items-end",
@@ -1428,15 +1451,15 @@ def experiment_page() -> html.Div:
                                         html.Br(),
                                         dbc.Row(
                                             [
-                                                dbc.Col(dcc.Graph(id="tournament-leaderboard"), md=6),
-                                                dbc.Col(dcc.Graph(id="tournament-points-timeline"), md=6),
+                                                dbc.Col(dcc.Graph(id="tournament-leaderboard", config=GRAPH_CONFIG), md=6),
+                                                dbc.Col(dcc.Graph(id="tournament-points-timeline", config=GRAPH_CONFIG), md=6),
                                             ]
                                         ),
                                         html.Br(),
                                         dbc.Row(
                                             [
-                                                dbc.Col(dcc.Graph(id="tournament-wl-timeline"), md=8),
-                                                dbc.Col(dcc.Graph(id="tournament-points-pie"), md=4),
+                                                dbc.Col(dcc.Graph(id="tournament-wl-timeline", config=GRAPH_CONFIG), md=8),
+                                                dbc.Col(dcc.Graph(id="tournament-points-pie", config=GRAPH_CONFIG), md=4),
                                             ],
                                             className="g-3",
                                         ),
@@ -1505,10 +1528,15 @@ def experiment_page() -> html.Div:
                                             [
                                                 dbc.Col(
                                                     [
-                                                        dbc.Button("New match", id="human-new", color="primary", className="me-2"),
-                                                        dbc.Button("Cooperate", id="human-cooperate", color="success", className="me-2", disabled=True),
-                                                        dbc.Button("Defect", id="human-defect", color="warning", className="me-2", disabled=True),
-                                                        dbc.Button("Reset", id="human-reset", color="danger", outline=True),
+                                                        html.Div(
+                                                            [
+                                                                dbc.Button("New match", id="human-new", color="primary"),
+                                                                dbc.Button("Cooperate", id="human-cooperate", color="success", disabled=True),
+                                                                dbc.Button("Defect", id="human-defect", color="warning", disabled=True),
+                                                                dbc.Button("Reset", id="human-reset", color="danger", outline=True),
+                                                            ],
+                                                            className="btn-row",
+                                                        ),
                                                     ]
                                                 )
                                             ]
@@ -1517,7 +1545,7 @@ def experiment_page() -> html.Div:
                                         html.Div(id="human-status", className="muted"),
                                         dbc.Row(
                                             [
-                                                dbc.Col(dcc.Graph(id="human-score-graph"), md=12),
+                                                dbc.Col(dcc.Graph(id="human-score-graph", config=GRAPH_CONFIG), md=12),
                                             ],
                                             className="g-3",
                                         ),
@@ -2183,6 +2211,28 @@ def sync_sim_settings(rounds, reps, seed, horizon_known, current):
 
 
 @callback(
+    Output("tournament-strategies", "value"),
+    Output("tournament-random-feedback", "children"),
+    Input("tournament-random-10", "n_clicks"),
+    State("tournament-seed", "value"),
+    prevent_initial_call=True,
+)
+def pick_random_strategies(n_clicks, seed):
+    # Use the current seed so users can reproduce random selections;
+    # add n_clicks so repeated presses produce new samples.
+    names = list_strategy_names()
+    if not names:
+        return [], "No strategies available."
+
+    k = min(10, len(names))
+    base_seed = int(seed or 0)
+    clicks = int(n_clicks or 0)
+    rng = random.Random((base_seed + 1000003 * clicks) & 0xFFFFFFFF)
+    chosen = rng.sample(names, k=k)
+    return chosen, f"Selected {len(chosen)} random strategies."
+
+
+@callback(
     Output("tournament-state", "data"),
     Output("tournament-interval", "disabled"),
     Output("tournament-status", "children"),
@@ -2225,13 +2275,25 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             rp = int(rounds_played.get(s, 0))
             c = int(coop.get(s, 0))
             coop_rate = (c / rp) if rp else 0.0
+            w = int(wins.get(s, 0))
+            l = int(losses.get(s, 0))
+            t = int(ties.get(s, 0))
+            matches = w + l + t
+            win_pct = (w / matches) if matches else 0.0
+
+            total_points = int(totals.get(s, 0))
+            ppt = (total_points / rp) if rp else 0.0  # points per turn (turn == round played)
+            ppr = (total_points / matches) if matches else 0.0  # avg points per match ("round" of opponents)
             rows.append(
                 {
                     "strategy": s,
-                    "total_points": int(totals.get(s, 0)),
-                    "wins": int(wins.get(s, 0)),
-                    "losses": int(losses.get(s, 0)),
-                    "ties": int(ties.get(s, 0)),
+                    "total_points": total_points,
+                    "wins": w,
+                    "losses": l,
+                    "ties": t,
+                    "win_pct": win_pct,
+                    "ppt": ppt,
+                    "ppr": ppr,
                     "cooperate_rate": coop_rate,
                 }
             )
@@ -2258,9 +2320,12 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                 {"name": "Wins", "id": "wins"},
                 {"name": "Losses", "id": "losses"},
                 {"name": "Ties", "id": "ties"},
-                {"name": "Cooperate rate", "id": "cooperate_rate"},
+                {"name": "Win %", "id": "win_pct"},
+                {"name": "PPT", "id": "ppt"},
+                {"name": "PPR", "id": "ppr"},
+                {"name": "Cooperation Rate", "id": "cooperate_rate"},
             ],
-            data=df.round({"cooperate_rate": 4}).to_dict("records"),
+            data=df.round({"win_pct": 4, "ppt": 4, "ppr": 4, "cooperate_rate": 4}).to_dict("records"),
             sort_action="native",
             page_size=10,
             style_table={"overflowX": "auto"},
@@ -2364,21 +2429,48 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
         wl_rows: list[dict] = []
         for snap in timeline:
             md = int(snap.get("matches_done", 0))
-            for s, v in (snap.get("totals", {}) or {}).items():
-                points_rows.append({"matches_done": md, "strategy": s, "total_points": int(v)})
-            wins = snap.get("match_wins", {}) or {}
-            losses = snap.get("match_losses", {}) or {}
-            ties = snap.get("match_ties", {}) or {}
-            for s in set(list(wins.keys()) + list(losses.keys()) + list(ties.keys())):
-                wl_rows.append(
-                    {
-                        "matches_done": md,
-                        "strategy": s,
-                        "wins": int(wins.get(s, 0)),
-                        "losses": int(losses.get(s, 0)),
-                        "ties": int(ties.get(s, 0)),
-                    }
-                )
+            names = list(current_state.get("strategy_names", []) or [])
+
+            # Support both snapshot formats:
+            # - legacy: dicts keyed by strategy name
+            # - compact: lists aligned to `strategy_names` order
+            totals_snap = snap.get("totals", {}) or {}
+            if isinstance(totals_snap, list):
+                for s, v in zip(names, totals_snap):
+                    points_rows.append({"matches_done": md, "strategy": s, "total_points": int(v)})
+            else:
+                for s, v in dict(totals_snap).items():
+                    points_rows.append({"matches_done": md, "strategy": s, "total_points": int(v)})
+
+            wins_snap = snap.get("match_wins", {}) or {}
+            losses_snap = snap.get("match_losses", {}) or {}
+            ties_snap = snap.get("match_ties", {}) or {}
+
+            if isinstance(wins_snap, list) and isinstance(losses_snap, list) and isinstance(ties_snap, list):
+                for idx, s in enumerate(names):
+                    wl_rows.append(
+                        {
+                            "matches_done": md,
+                            "strategy": s,
+                            "wins": int(wins_snap[idx]) if idx < len(wins_snap) else 0,
+                            "losses": int(losses_snap[idx]) if idx < len(losses_snap) else 0,
+                            "ties": int(ties_snap[idx]) if idx < len(ties_snap) else 0,
+                        }
+                    )
+            else:
+                wins = dict(wins_snap) if isinstance(wins_snap, dict) else {}
+                losses = dict(losses_snap) if isinstance(losses_snap, dict) else {}
+                ties = dict(ties_snap) if isinstance(ties_snap, dict) else {}
+                for s in set(list(wins.keys()) + list(losses.keys()) + list(ties.keys())):
+                    wl_rows.append(
+                        {
+                            "matches_done": md,
+                            "strategy": s,
+                            "wins": int(wins.get(s, 0)),
+                            "losses": int(losses.get(s, 0)),
+                            "ties": int(ties.get(s, 0)),
+                        }
+                    )
 
         points_df = pd.DataFrame(points_rows)
         if not points_df.empty:
@@ -2504,12 +2596,28 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             chosen = list(strategies or [])
             if not chosen:
                 return _render(state, True, "Select at least 1 strategy to start.")
-            if len(chosen) > 10:
-                return _render(
-                    state,
-                    True,
-                    "Select up to 10 strategies (limit for performance and clarity).",
-                )
+            # Soft-limit: allow larger tournaments, but keep guardrails to prevent accidental overload.
+            max_strategies = 40
+            if len(chosen) > max_strategies:
+                return _render(state, True, f"Select up to {max_strategies} strategies.")
+
+            n = len(chosen)
+            # Capture fewer timeline snapshots as strategy count increases to keep the
+            # client/server state small (Dash stores send full JSON state each tick).
+            if n <= 12:
+                timeline_stride = 1
+            elif n <= 20:
+                timeline_stride = 2
+            elif n <= 30:
+                timeline_stride = 4
+            else:
+                timeline_stride = 6
+
+            # Keep recent/timeline bounded to avoid huge payloads.
+            # (Timeline snapshots are compact arrays aligned to strategy_names order.)
+            recent_limit = 160 if n <= 20 else 120
+            timeline_limit = 260 if n <= 20 else 200
+
             custom_map = {s["name"]: s["config"] for s in (custom_strategies or []) if isinstance(s, dict) and "name" in s and "config" in s}
             state = init_tournament_state(
                 strategy_names=chosen,
@@ -2517,6 +2625,9 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                 repetitions=int(reps or 10),
                 seed=int(seed or 0),
                 horizon_known=bool(horizon_known),
+                recent_limit=recent_limit,
+                timeline_limit=timeline_limit,
+                timeline_stride=timeline_stride,
                 custom_strategies=custom_map,
             )
         except Exception as e:
@@ -2542,9 +2653,45 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
 
     # Tick simulation if we're running and have state.
     if triggered == "tournament-interval" and state and not state.get("done"):
-        state = step_tournament(state, max_rounds=600)
-        status = "Running…"
+        # Step the simulation aggressively, but avoid re-rendering heavy figures/tables every tick.
+        state = step_tournament(state, max_rounds=1200)
         interval_disabled = False
+
+        n = len(list(state.get("strategy_names", []) or []))
+        matches_done = int(state.get("matches_done", 0))
+        total_matches = int(state.get("total_matches", 1)) or 1
+        pct = int(round(100 * (matches_done / total_matches)))
+        label = "Done" if bool(state.get("done")) else f"{pct}%"
+
+        # Throttle expensive redraws as strategy count grows.
+        if n <= 12:
+            render_every = 1
+        elif n <= 20:
+            render_every = 2
+        elif n <= 30:
+            render_every = 4
+        else:
+            render_every = 6
+
+        status = f"Running… Match {matches_done}/{total_matches} (updating charts every ~{render_every} matches)"
+
+        # Only rebuild charts/tables periodically; keep progress/status responsive.
+        if (matches_done % render_every) != 0:
+            return (
+                state,
+                interval_disabled,
+                status,
+                pct,
+                label,
+                dash.no_update,
+                dash.no_update,
+                dash.no_update,
+                dash.no_update,
+                False,
+                dash.no_update,
+                dash.no_update,
+                dash.no_update,
+            )
 
     return _render(state, interval_disabled, status)
 

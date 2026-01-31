@@ -1599,6 +1599,7 @@ def init_tournament_state(
     horizon_known: bool = True,
     recent_limit: int = 200,
     timeline_limit: int = 400,
+    timeline_stride: int = 1,
     custom_strategies: Optional[dict[str, dict]] = None,
 ) -> dict:
     """
@@ -1613,6 +1614,7 @@ def init_tournament_state(
     repetitions = int(repetitions)
     seed = int(seed)
     horizon_known = bool(horizon_known)
+    timeline_stride = max(1, int(timeline_stride))
     if rounds_per_match <= 0:
         raise ValueError("rounds_per_match must be > 0")
     if repetitions <= 0:
@@ -1670,6 +1672,9 @@ def init_tournament_state(
         "recent": [],
         # match-level timeline snapshots (for live charts)
         "timeline_limit": int(timeline_limit),
+        # Capture a snapshot every N matches to keep state compact.
+        # (Dash stores pass state back/forth; large timelines hurt performance.)
+        "timeline_stride": int(timeline_stride),
         "timeline": [],
         # UI helpers
         "summary_shown": False,
@@ -1742,6 +1747,7 @@ def step_tournament(state: dict, *, max_rounds: int = 500) -> dict:
     rounds_per_match = int(state["rounds_per_match"])
     recent_limit = int(state.get("recent_limit", 200))
     timeline_limit = int(state.get("timeline_limit", 400))
+    timeline_stride = max(1, int(state.get("timeline_stride", 1)))
 
     for _ in range(max_rounds):
         if state.get("done"):
@@ -1806,18 +1812,26 @@ def step_tournament(state: dict, *, max_rounds: int = 500) -> dict:
 
             state["matches_done"] = int(state["matches_done"]) + 1
 
-            # snapshot match-level aggregates for live charts
-            state["timeline"].append(
-                {
-                    "matches_done": int(state["matches_done"]),
-                    "totals": dict(state["totals"]),
-                    "match_wins": dict(state["match_wins"]),
-                    "match_losses": dict(state["match_losses"]),
-                    "match_ties": dict(state["match_ties"]),
-                }
-            )
-            if len(state["timeline"]) > timeline_limit:
-                state["timeline"] = state["timeline"][-timeline_limit:]
+            # Snapshot match-level aggregates for live charts.
+            #
+            # IMPORTANT: keep snapshots compact. Repeated dict copies (with strategy names as keys)
+            # balloon the JSON state and slow Dash callbacks dramatically as strategy count grows.
+            md = int(state["matches_done"])
+            should_snapshot = (md % timeline_stride == 0)
+            if should_snapshot or bool(state.get("done")):
+                names: list[str] = state.get("strategy_names", [])
+                state["timeline"].append(
+                    {
+                        "matches_done": md,
+                        # Compact: align arrays to `strategy_names` order (names stored once).
+                        "totals": [int(state["totals"].get(s, 0)) for s in names],
+                        "match_wins": [int(state["match_wins"].get(s, 0)) for s in names],
+                        "match_losses": [int(state["match_losses"].get(s, 0)) for s in names],
+                        "match_ties": [int(state["match_ties"].get(s, 0)) for s in names],
+                    }
+                )
+                if len(state["timeline"]) > timeline_limit:
+                    state["timeline"] = state["timeline"][-timeline_limit:]
 
             state = _advance_pair(state)
 
