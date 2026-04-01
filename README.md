@@ -4,7 +4,6 @@
 
 - Learn the basics: [Stanford Encyclopedia of Philosophy — Prisoner’s Dilemma](https://plato.stanford.edu/entries/prisoner-dilemma/)
 
-> Live demo (Render): *(add your Render URL here)*
 
 ## What you can do
 
