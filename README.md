@@ -2,7 +2,7 @@
 
 **Prisoner’s Dilemma Simulation** is a public-facing web app for exploring the *Iterated* Prisoner’s Dilemma: run tournaments, inspect strategies, compare head‑to‑head behavior, and play matches yourself.
 
-- Learn the basics: [Stanford Encyclopedia of Philosophy — Prisoner’s Dilemma](https://plato.stanford.edu/entries/prisoner-dilemma/)
+- Learn the basics: [Stanford Encyclopedia of Philosophy: Prisoner’s Dilemma](https://plato.stanford.edu/entries/prisoner-dilemma/)
 
 
 ## What you can do
@@ -13,12 +13,45 @@
 - **Compare two strategies** head‑to‑head
 - **Build a custom strategy** (safe rule-based controls) and test it in tournaments
 - **Export results and charts** as CSV / PNG / PDF
+- **Learn the game** through an interactive payoff example and short lessons on repetition, mistakes, and result interpretation
+
+Live tournament charts normalize points and moves by rounds played so partial
+round-robin progress does not favor strategies that happened to play first. The
+dashboard also plots payoff efficiency against cooperation, while human matches
+pair cumulative scores with a round-by-round cooperation/defection ribbon.
+The profile page includes a selectable pairwise matchup matrix for payoff,
+cooperation, win rate, and score margin. The custom builder previews unsaved rules
+against scripted opponents, and complete experiment settings can be exported and
+restored as a versioned JSON file.
+
+The strategy-builder preview also exposes a round-by-round decision trace for its
+base response, safety override, reputation threshold, endgame rule, and noise.
+This makes composed strategies inspectable before they are saved or entered into
+a tournament.
+
+The Experiment page is organized into four steps: **Choose, Configure, Run, and
+Review**. Optional tournament settings are separate from the basic setup. Run
+controls remain visible while results update and adapt to narrow screens.
+
+Tournament and human-match controls can add reproducible execution errors. The
+simulator records both the move a player intended and the move that was actually
+executed, so accidental defections and recovery behavior remain inspectable.
+Live tournaments can also include self-play, adding each strategy's diagonal
+matchup to the usual round robin. Both settings are preserved in exported
+experiment configurations.
+
+The UI labels the default settings as the **Classic IPD format**. Enabling
+self-play or a non-zero execution-error probability displays an **Experimental
+variant** notice so extensions to the app's original unique-pairing,
+error-free format are never mistaken for the baseline game. These variants keep
+the same two legal actions and payoff matrix.
 
 ## Pages / routes
 
 | Route | Purpose |
 |------:|---------|
 | `/` | Overview, background, and key concepts |
+| `/learn` | Interactive introduction to incentives, repeated play, mistakes, and interpreting results |
 | `/experiment` | Live tournament runner + “Play a match” + custom strategy builder |
 | `/profiles` | Strategy profiles + analytics + comparisons |
 | `/donate` | PayPal hosted button |
@@ -45,6 +78,69 @@ Each round uses the classic payoff structure shown in-app:
 - **Known match length**: when enabled, strategies may know the total round count (enabling end‑game behavior)
 
 For performance and clarity, live tournaments are capped at **10 strategies per run**.
+
+## Built-in strategy catalog
+
+The app includes 48 built-in strategies. They range from standard IPD baselines
+to project-specific experimental policies:
+
+- **Baselines:** MrNiceGuy (always cooperate), BadCop (always defect), ImSoRandom
+- **Reciprocity:** TitForTat, SuspiciousTitForTat, GenerousTitForTat, Joss, WinStayLoseShift
+- **Retaliation variants:** TitForTwoTats, TwoTitsForTat, HardTitForTat, Gradual, HoldingAGrudge, PastTrauma
+- **Majority and threshold policies:** SoftMajority, HardMajority, CalculatedDefector, ForgiveButDontForget
+- **Testing and adaptive heuristics:** Prober, LongTermRelationship, KeepingPeace, ParkBus, Illuminati
+- **Experimental learners:** DebtCollector (repayable trust ledger), PatternHunter (transition prediction),
+  and EntropyBroker (recent-behavior uncertainty shield)
+- **Schedules and novelty policies:** BadAlternator, RitualDefection, TripleThreat, Pattern, RandomPrime,
+  Fibonacci, DefectiveFriedman, CooperativeProth, FriendlySquare, and Shootout
+- **Phase and commitment policies:** Pushover, Thief, NeverSwitchUp, LosingMyMind, and DefectiveDeputy
+- **Opponent classification and endgame policies:** BadJudgeOfCharacter, BadDivorce, RandomStranger,
+  MarkedMan, and Lottery
+
+The similarly named retaliation strategies intentionally differ:
+
+| Strategy | Rule |
+|---|---|
+| **TitForTwoTats** | Defect only after two consecutive opponent defections |
+| **TwoTitsForTat** | Defect when the opponent defected in either of the previous two rounds |
+| **HardTitForTat** | Defect when the opponent defected in any of the previous three rounds |
+| **Gradual** | Add increasingly long punishments after successive defections, then cooperate twice to calm the interaction |
+
+SoftMajority cooperates on tied histories, including the opening move;
+HardMajority defects on ties. Strategy profile pages show whether a policy is
+deterministic or stochastic, reactive or scheduled, and how much memory it uses.
+
+### Strategy configuration and reproducibility
+
+Built-in profiles, aliases, traits, and horizon-aware declarations live in
+`pages/strategy_catalog.py`. New built-ins must also provide batch and incremental
+implementations and parity coverage in `tests/test_strategies.py`.
+
+Batch tournaments use a tournament-local random generator, so a seed produces
+repeatable results without changing Python's process-global random state. Live
+tournaments keep their random state inside the JSON-serializable tournament state,
+allowing a paused experiment to resume exactly.
+
+Custom strategies accept the following normalized fields:
+
+| Field | Accepted value |
+|---|---|
+| `start_move` | `cooperate` or `defect` |
+| `use_tft` | Boolean |
+| `use_grudge` | Boolean |
+| `response_mode` | `fixed`, `tft`, `anti_tft`, `soft_majority`, or `hard_majority` |
+| `retaliation_window` | Non-negative integer |
+| `threshold_enabled` | Boolean |
+| `defect_rate_threshold` | Number from 0 through 1 |
+| `min_history` | Non-negative integer |
+| `endgame_after_turn` | Non-negative integer |
+| `noise` | Number from 0 through 1 |
+
+Unknown fields and invalid values are rejected before a tournament or human match
+starts. The visual builder includes recipe starters and composes rules in an explicit
+order: base response, retaliation, reputation threshold, endgame, then noise. Live
+tournaments accept 2–10 strategies, with bounded round, repetition,
+recent-event, and timeline settings to protect server and browser state.
 
 ## Run locally
 
