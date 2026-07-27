@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import io
 from functools import lru_cache
 from pathlib import Path
+import base64
+import json
 import random
 
 import dash
@@ -22,7 +23,10 @@ try:
     from .game_logic import (
         init_human_match_state,
         init_tournament_state,
+        _init_strategy_state,
         list_strategy_names,
+        payoff,
+        play_strategy,
         simulate_tournament,
         step_human_match,
         step_tournament,
@@ -33,7 +37,10 @@ except ImportError:
     from game_logic import (  # type: ignore
         init_human_match_state,
         init_tournament_state,
+        _init_strategy_state,
         list_strategy_names,
+        payoff,
+        play_strategy,
         simulate_tournament,
         step_human_match,
         step_tournament,
@@ -41,212 +48,10 @@ except ImportError:
     )
 
 
-# ----------------------------
-# Strategy profiles (metadata)
-# ----------------------------
-
-STRATEGY_PROFILES: dict[str, dict[str, str]] = {
-    "MrNiceGuy": {
-        "description": "Always cooperates. Baseline for measuring how strategies exploit unconditional cooperation.",
-        "origin": "Project baseline strategy (unconditional cooperator).",
-        "notes": "Scores well against other cooperators, but is heavily exploited by defect-heavy strategies.",
-    },
-    "BadCop": {
-        "description": "Always defects. Baseline for measuring robustness against exploitation.",
-        "origin": "Project baseline strategy (unconditional defector).",
-        "notes": "Often wins short-term vs cooperators; performs poorly in mutual-defection matchups.",
-    },
-    "TitForTat": {
-        "description": "Cooperates first, then copies the opponent’s previous move.",
-        "origin": "Classic strategy popularized by the Axelrod tournaments (submitted by Anatol Rapoport).",
-        "notes": "Typically strong in repeated games: nice, retaliatory, forgiving, and clear.",
-    },
-    "ImSoRandom": {
-        "description": "Randomly cooperates or defects each turn (50/50).",
-        "origin": "Project baseline strategy (stochastic behavior).",
-        "notes": "Useful to test whether strategies handle noise/unpredictability.",
-    },
-    "CalculatedDefector": {
-        "description": "Cooperates unless the opponent defects “too often” (threshold-based).",
-        "origin": "Project-defined heuristic.",
-        "notes": "Designed to tolerate occasional defection but punish sustained defection.",
-    },
-    "HoldingAGrudge": {
-        "description": "Cooperates until the opponent defects once, then defects forever.",
-        "origin": "Project-defined grudge strategy (grim-trigger style).",
-        "notes": "Very punishing; can do well against defectors but can lock into mutual defection after a single defection.",
-    },
-    "ForgiveButDontForget": {
-        "description": "Defects if the opponent’s historical defection rate is high; otherwise cooperates.",
-        "origin": "Project-defined forgiveness heuristic.",
-        "notes": "More forgiving than a pure grudge; still punishes frequent defectors.",
-    },
-    "BadAlternator": {
-        "description": "Alternates cooperate/defect each turn (C, D, C, D...).",
-        "origin": "Project-defined deterministic cycle strategy.",
-        "notes": "Can confuse reactive opponents; performance depends strongly on opponent’s response to alternation.",
-    },
-    "RitualDefection": {
-        "description": "Mostly cooperates, but defects on a fixed schedule (every 5th move).",
-        "origin": "Project-defined periodic strategy.",
-        "notes": "Introduces predictable “ritual” defection; tests opponent retaliation/forgiveness.",
-    },
-    "TripleThreat": {
-        "description": "Defects for a 3-turn block in a 6-turn cycle (CCC DDD repeating).",
-        "origin": "Project-defined cyclic strategy.",
-        "notes": "Creates sustained defection bursts; can trigger long retaliation cycles in grudge-like opponents.",
-    },
-    "Pushover": {
-        "description": "Starts responsive, then eventually gives in and cooperates regardless of the opponent.",
-        "origin": "Project-defined 'softening' strategy.",
-        "notes": "Can reduce long retaliation cycles, but risks being exploited late in the match.",
-    },
-    "Thief": {
-        "description": "Builds cooperation early, then shifts behavior later to try to take advantage.",
-        "origin": "Project-defined 'phase shift' strategy.",
-        "notes": "Useful for studying end-game betrayal and how retaliation-based opponents react.",
-    },
-    "Pattern": {
-        "description": "Repeats a fixed pattern: 3 defects, then 3 cooperates, then repeat (DDD CCC ...).",
-        "origin": "Project-defined deterministic pattern strategy.",
-        "notes": "Predictable by design; tests whether opponents adapt to periodic behavior. (Intentionally distinct from TripleThreat.)",
-    },
-    "NeverSwitchUp": {
-        "description": "Randomly chooses cooperate or defect once, then sticks with it for the entire match.",
-        "origin": "Project-defined commitment strategy (stochastic initialization).",
-        "notes": "A controlled way to test 'committed' behavior vs reactive opponents.",
-    },
-    "WinStayLoseShift": {
-        "description": "Repeats its last move if it was rewarded; otherwise switches (Pavlov / WSLS).",
-        "origin": "Classic IPD baseline (Pavlov / Win‑Stay, Lose‑Shift).",
-        "notes": "Often strong in noisy settings; can quickly return to cooperation after mutual cooperation.",
-    },
-    "TitForTwoTats": {
-        "description": "Cooperates by default; defects only after two consecutive opponent defections.",
-        "origin": "Classic forgiving TFT variant (TF2T).",
-        "notes": "More forgiving than TFT; less likely to spiral into retaliation after a single defection.",
-    },
-    "SuspiciousTitForTat": {
-        "description": "Defects on the first move, then mirrors the opponent’s previous move.",
-        "origin": "Classic TFT variant (STFT).",
-        "notes": "A 'hostile start' version of TFT; useful for testing strategies against early aggression.",
-    },
-    "GenerousTitForTat": {
-        "description": "Like TFT, but sometimes forgives defections and cooperates anyway (stochastic).",
-        "origin": "Classic TFT variant (GTFT).",
-        "notes": "Designed to sustain cooperation under noise; introduces controlled forgiveness.",
-    },
-    "Joss": {
-        "description": "TFT with occasional random defection ('spite') even after opponent cooperation.",
-        "origin": "Classic stochastic variant of TFT (Joss).",
-        "notes": "Injects unpredictability; can exploit overly trusting opponents but may reduce cooperation stability.",
-    },
-    "Prober": {
-        "description": "Probes early (D, C, C), then exploits if the opponent never retaliates; otherwise switches to TFT.",
-        "origin": "Classic 'tester' strategy (Prober).",
-        "notes": "Aims to detect unconditional cooperators; otherwise behaves similarly to TFT.",
-    },
-    "RandomPrime": {
-        "description": "Defects by default; on prime-numbered turns it plays randomly.",
-        "origin": "Project-defined novelty strategy (number-based turn schedule).",
-        "notes": "A mostly-defect strategy with periodic randomness tied to primes.",
-    },
-    "Fibonacci": {
-        "description": "Starts with a random base choice; plays it on Fibonacci-numbered turns, otherwise plays the opposite.",
-        "origin": "Project-defined novelty strategy (Fibonacci turn schedule).",
-        "notes": "Creates structured alternation driven by the Fibonacci sequence.",
-    },
-    "DefectiveFriedman": {
-        "description": "Defects on turns whose round number is a Friedman number; otherwise cooperates.",
-        "origin": "Project-defined novelty strategy inspired by Friedman numbers.",
-        "notes": "Rare, irregular defections determined by a curated Friedman set.",
-    },
-    "CooperativeProth": {
-        "description": "Cooperates on Proth-numbered turns; otherwise defects.",
-        "origin": "Project-defined novelty strategy inspired by Proth numbers.",
-        "notes": "Structured cooperation tied to a number-theory predicate.",
-    },
-    "LongTermRelationship": {
-        "description": "Cooperates when overall cooperation is high, defects when it’s low, and randomizes in the middle.",
-        "origin": "Project-defined relationship-health heuristic.",
-        "notes": "Uses overall cooperation rate as a proxy for 'trust' and adapts accordingly.",
-    },
-    "Parrot": {
-        "description": "Starts random, then copies the opponent for 5 turns, then goes random for 1 turn, repeating.",
-        "origin": "Project-defined periodic mimic strategy.",
-        "notes": "Mostly reactive (copying) with occasional 'reset' randomness.",
-    },
-    "OneStepBehind": {
-        "description": "Starts random, then always plays the opposite of the opponent’s previous move.",
-        "origin": "Project-defined anti-mirroring strategy.",
-        "notes": "Tries to 'beat' what the opponent did last round; can destabilize cooperation loops.",
-    },
-    "FriendlySquare": {
-        "description": "Cooperates on perfect-square turns (1, 4, 9, 16, …); otherwise plays randomly.",
-        "origin": "Project-defined novelty strategy (square-number schedule).",
-        "notes": "Mostly random with occasional deterministic cooperation markers.",
-    },
-    "LosingMyMind": {
-        "description": "Starts fully cooperative and becomes increasingly random each turn.",
-        "origin": "Project-defined gradual-noise strategy.",
-        "notes": "Models 'deteriorating consistency' over time without relying on match-length knowledge.",
-    },
-    "KeepingPeace": {
-        "description": "Starts cooperative and tries to keep the match as close to a tie as possible in points.",
-        "origin": "Project-defined 'tie-seeking' heuristic.",
-        "notes": "Tracks its own and the opponent’s points and adjusts to reduce score imbalance.",
-    },
-    "BadJudgeOfCharacter": {
-        "description": "Starts defecting; after 3 rounds it either defects forever or randomizes based on early opponent behavior.",
-        "origin": "Project-defined early-judgment strategy.",
-        "notes": "If the opponent defects more than cooperates in the first 3 rounds, it commits to defecting forever.",
-    },
-    "DefectiveDeputy": {
-        "description": "Defect-leaning strategy that becomes more likely to defect each turn.",
-        "origin": "Project-defined ramping defector.",
-        "notes": "A gradually-hardening policy that trends toward always defecting.",
-    },
-    "BadDivorce": {
-        "description": "Defects almost every turn, with one surprise cooperation on a random round.",
-        "origin": "Project-defined endgame-flavored strategy.",
-        "notes": "Defects N−1 times and cooperates once (never on the first move).",
-    },
-    "RandomStranger": {
-        "description": "Mostly random, but defects at the end to try to 'get one over' on the opponent.",
-        "origin": "Project-defined endgame betrayal strategy.",
-        "notes": "Random for most of the match; defects on the final turn when the horizon is known.",
-    },
-    "PastTrauma": {
-        "description": "Cooperates until the opponent defects 3 total times, then defects forever.",
-        "origin": "Project-defined threshold grudge strategy.",
-        "notes": "The three defections do not need to be consecutive.",
-    },
-    "MarkedMan": {
-        "description": "Defects about 90% of the time, cooperates about 10% (paranoia breaks occasionally).",
-        "origin": "Project-defined stochastic paranoia strategy.",
-        "notes": "A fixed-probability mixture policy (mostly defect).",
-    },
-    "Lottery": {
-        "description": "Defects throughout, then plays randomly on the final turn (if the horizon is known).",
-        "origin": "Project-defined endgame gamble strategy.",
-        "notes": "If match length is unknown, it behaves as an always-defect policy.",
-    },
-    "Shootout": {
-        "description": "Cooperates on the first move, then defects every other turn.",
-        "origin": "Project-defined alternating duel strategy.",
-        "notes": "Creates a predictable C/D rhythm after the opening cooperate.",
-    },
-    "ParkBus": {
-        "description": "Defects until it gets ahead on points, then cooperates forever.",
-        "origin": "Project-defined 'lock-in lead' strategy.",
-        "notes": "Attempts to secure an early advantage and then play defensively (cooperate) to preserve it.",
-    },
-    "Illuminati": {
-        "description": "Classified (black box).",
-        "origin": "Project-defined hidden strategy.",
-        "notes": "This strategy’s logic is intentionally not disclosed in the UI.",
-    },
-}
+try:
+    from .strategy_catalog import STRATEGY_PROFILES, strategy_scorecard
+except ImportError:
+    from strategy_catalog import STRATEGY_PROFILES, strategy_scorecard  # type: ignore
 
 
 # ----------------------------
@@ -313,146 +118,6 @@ def match_level(persp: pd.DataFrame) -> pd.DataFrame:
     m.loc[m["points"] > m["opp_points"], "outcome"] = "win"
     m.loc[m["points"] < m["opp_points"], "outcome"] = "loss"
     return m
-
-
-# ----------------------------
-# Strategy classification (tags)
-# ----------------------------
-
-
-def strategy_scorecard(name: str) -> dict[str, object]:
-    """
-    Static-ish strategy classification for UI badges/scorecards.
-
-    This is intentionally simple (human-readable, not 'perfect' taxonomy).
-    """
-
-    nm = str(name or "")
-    nm = {
-        "ThePushover": "Pushover",
-        "TheThief": "Thief",
-        "ParrotPicker": "Parrot",
-        "KeepingThePeace": "KeepingPeace",
-    }.get(nm, nm)
-
-    deterministic = nm in {
-        "MrNiceGuy",
-        "BadCop",
-        "TitForTat",
-        "WinStayLoseShift",
-        "TitForTwoTats",
-        "SuspiciousTitForTat",
-        "CalculatedDefector",
-        "HoldingAGrudge",
-        "ForgiveButDontForget",
-        "BadAlternator",
-        "RitualDefection",
-        "TripleThreat",
-        "Pushover",
-        "Thief",
-        "Pattern",
-        "OneStepBehind",
-        "KeepingPeace",
-        "ParkBus",
-        "Shootout",
-        "Illuminati",
-    }
-
-    stochastic = nm in {
-        "ImSoRandom",
-        "NeverSwitchUp",
-        "GenerousTitForTat",
-        "Joss",
-        "Prober",
-        "RandomPrime",
-        "Fibonacci",
-        "LongTermRelationship",
-        "Parrot",
-        "FriendlySquare",
-        "LosingMyMind",
-        "BadJudgeOfCharacter",
-        "DefectiveDeputy",
-        "BadDivorce",
-        "RandomStranger",
-        "MarkedMan",
-        "Lottery",
-    }
-
-    # Rough "memory depth": 0, 1, or "many"
-    if nm in {"MrNiceGuy", "BadCop", "BadAlternator", "RitualDefection", "TripleThreat", "Pattern", "FriendlySquare", "Shootout"}:
-        memory: object = 0
-    elif nm in {"TitForTat", "SuspiciousTitForTat", "WinStayLoseShift", "Joss", "OneStepBehind", "Parrot"}:
-        memory = 1
-    elif nm in {
-        "HoldingAGrudge",
-        "CalculatedDefector",
-        "ForgiveButDontForget",
-        "TitForTwoTats",
-        "Prober",
-        "LongTermRelationship",
-        "KeepingPeace",
-        "ParkBus",
-        "Illuminati",
-        "BadJudgeOfCharacter",
-        "PastTrauma",
-    }:
-        memory = "many"
-    else:
-        memory = "unknown"
-
-    # Primary tendency (very rough)
-    primary_coop = nm in {"MrNiceGuy", "TitForTat", "WinStayLoseShift", "TitForTwoTats", "GenerousTitForTat", "Pushover", "KeepingPeace"}
-    primary_defect = nm in {"BadCop", "CalculatedDefector", "HoldingAGrudge", "Thief", "OneStepBehind", "DefectiveDeputy", "BadDivorce", "ParkBus"}
-
-    # Uses turn counter / schedule
-    time_based = nm in {
-        "BadAlternator",
-        "RitualDefection",
-        "TripleThreat",
-        "Pattern",
-        "NeverSwitchUp",
-        "RandomPrime",
-        "Fibonacci",
-        "DefectiveFriedman",
-        "CooperativeProth",
-        "Parrot",
-        "FriendlySquare",
-        "LosingMyMind",
-        "Shootout",
-        "BadDivorce",
-        "RandomStranger",
-        "Lottery",
-    }
-
-    reactive = nm in {
-        "TitForTat",
-        "SuspiciousTitForTat",
-        "TitForTwoTats",
-        "WinStayLoseShift",
-        "Joss",
-        "Prober",
-        "CalculatedDefector",
-        "HoldingAGrudge",
-        "ForgiveButDontForget",
-        "Pushover",
-        "Parrot",
-        "OneStepBehind",
-        "LongTermRelationship",
-        "KeepingPeace",
-        "ParkBus",
-        "Illuminati",
-        "PastTrauma",
-    }
-
-    return {
-        "deterministic": bool(deterministic and not stochastic),
-        "stochastic": bool(stochastic),
-        "memory": memory,
-        "primarily_cooperative": bool(primary_coop),
-        "primarily_defective": bool(primary_defect),
-        "reactive": bool(reactive),
-        "time_based": bool(time_based),
-    }
 
 
 # ----------------------------
@@ -557,6 +222,74 @@ def navbar_links() -> list[dbc.NavLink]:
 pio.templates.default = "plotly_white"
 
 GRAPH_CONFIG = {"displayModeBar": False, "responsive": True}
+def _tournament_metrics_frame(state: dict) -> pd.DataFrame:
+    """Return comparable live metrics without favoring strategies that played first."""
+    rows = []
+    for strategy in state.get("strategy_names", []) or []:
+        rounds = int((state.get("rounds_played", {}) or {}).get(strategy, 0))
+        points = int((state.get("totals", {}) or {}).get(strategy, 0))
+        cooperations = int((state.get("cooperate", {}) or {}).get(strategy, 0))
+        wins = int((state.get("match_wins", {}) or {}).get(strategy, 0))
+        losses = int((state.get("match_losses", {}) or {}).get(strategy, 0))
+        ties = int((state.get("match_ties", {}) or {}).get(strategy, 0))
+        matches = wins + losses + ties
+        rows.append(
+            {
+                "strategy": strategy,
+                "total_points": points,
+                "points_per_round": points / rounds if rounds else 0.0,
+                "cooperation_rate": cooperations / rounds if rounds else 0.0,
+                "defection_rate": (rounds - cooperations) / rounds if rounds else 0.0,
+                "win_rate": wins / matches if matches else 0.0,
+                "rounds_played": rounds,
+                "matches_played": matches,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _pairwise_metric_frame(results: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Build a strategy-by-opponent matrix for a selected matchup metric."""
+    persp = perspective_rows(results)
+    if persp.empty:
+        return pd.DataFrame()
+    grouped = persp.groupby(["strategy", "opponent"], as_index=False).agg(
+        points_per_round=("points", "mean"),
+        opponent_points_per_round=("opp_points", "mean"),
+        cooperation_rate=("move", lambda moves: float((moves == "cooperate").mean())),
+    )
+    grouped["score_margin"] = grouped["points_per_round"] - grouped["opponent_points_per_round"]
+    if metric == "win_rate":
+        matches = match_level(persp)
+        win_rates = matches.groupby(["strategy", "opponent"], as_index=False).agg(
+            win_rate=("outcome", lambda outcomes: float((outcomes == "win").mean()))
+        )
+        grouped = grouped.merge(win_rates, on=["strategy", "opponent"], how="left")
+    value = metric if metric in {"points_per_round", "cooperation_rate", "score_margin", "win_rate"} else "points_per_round"
+    return grouped.pivot(index="strategy", columns="opponent", values=value)
+
+
+def _custom_preview_rows(config: dict, opponent_moves: list[str], seed: int = 0) -> list[dict]:
+    """Evaluate an unsaved custom policy against a deterministic scripted opponent."""
+    name = "__preview__"
+    state = _init_strategy_state(name, config)
+    history: list[str] = []
+    rows = []
+    rng_state = seed & 0xFFFFFFFF
+    for round_number, opponent_move in enumerate(opponent_moves, start=1):
+        move, state, rng_state = play_strategy(name, history, state, rng_state)
+        player_points, opponent_points = payoff(move, opponent_move)
+        rows.append(
+            {
+                "round": round_number,
+                "custom_move": move,
+                "opponent_move": opponent_move,
+                "custom_points": player_points,
+                "opponent_points": opponent_points,
+            }
+        )
+        history.append(opponent_move)
+    return rows
 
 app.layout = html.Div(
     id="app-shell",
@@ -1298,6 +1031,30 @@ def profiles_page() -> html.Div:
                 },
             ),
             html.Hr(),
+            html.H3("Matchup matrix"),
+            html.P("See where each strategy earns its score. Rows are strategies and columns are opponents.", className="muted"),
+            dbc.Row(
+                dbc.Col(
+                    [
+                        dbc.Label("Matrix metric"),
+                        dcc.Dropdown(
+                            id="matchup-matrix-metric",
+                            options=[
+                                {"label": "Points per round", "value": "points_per_round"},
+                                {"label": "Cooperation rate", "value": "cooperation_rate"},
+                                {"label": "Score margin", "value": "score_margin"},
+                                {"label": "Win rate", "value": "win_rate"},
+                            ],
+                            value="points_per_round",
+                            clearable=False,
+                        ),
+                    ],
+                    md=4,
+                ),
+                className="mb-2",
+            ),
+            dcc.Graph(id="matchup-matrix", config=GRAPH_CONFIG),
+            html.Hr(),
             html.H3("Compare two strategies"),
             html.P("Compare head-to-head results and behaviors side-by-side.", className="muted"),
             dbc.Row(
@@ -1370,6 +1127,20 @@ def experiment_page() -> html.Div:
                         dcc.Interval(id="tournament-interval", interval=650, disabled=True),
                         dcc.Store(id="human-match-state"),
                         dcc.Store(id="custom-strategies", data=[]),
+                        dcc.Download(id="experiment-config-download"),
+                        html.Div(
+                            [
+                                dbc.Button("Export experiment", id="experiment-config-export", color="secondary", outline=True, size="sm"),
+                                dcc.Upload(
+                                    dbc.Button("Import experiment", color="secondary", outline=True, size="sm"),
+                                    id="experiment-config-upload",
+                                    accept="application/json,.json",
+                                    multiple=False,
+                                ),
+                                html.Span(id="experiment-config-status", className="muted"),
+                            ],
+                            className="btn-row mb-2",
+                        ),
                         dbc.Tabs(
                             [
                                 dbc.Tab(
@@ -1492,6 +1263,25 @@ def experiment_page() -> html.Div:
                                                 ),
                                                 dbc.Col(
                                                     [
+                                                        dbc.Switch(
+                                                            id="tournament-self-play",
+                                                            value=False,
+                                                            label="Include self-play",
+                                                        ),
+                                                        dbc.Label("Execution error probability", className="mt-2"),
+                                                        dbc.Input(
+                                                            id="tournament-error-rate",
+                                                            type="number",
+                                                            value=0.0,
+                                                            min=0.0,
+                                                            max=1.0,
+                                                            step=0.01,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                                dbc.Col(
+                                                    [
                                                         html.Div(
                                                             [
                                                                 dbc.Button("Start", id="tournament-start", color="success"),
@@ -1511,6 +1301,28 @@ def experiment_page() -> html.Div:
                                         html.Div(id="tournament-status", className="muted"),
                                         dbc.Progress(id="tournament-progress", value=0, striped=True, animated=True, className="mt-2"),
                                         html.Br(),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Rank leaderboard by"),
+                                                        dcc.Dropdown(
+                                                            id="tournament-rank-metric",
+                                                            options=[
+                                                                {"label": "Points per round", "value": "points_per_round"},
+                                                                {"label": "Total points", "value": "total_points"},
+                                                                {"label": "Win rate", "value": "win_rate"},
+                                                                {"label": "Cooperation rate", "value": "cooperation_rate"},
+                                                            ],
+                                                            value="points_per_round",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                            ],
+                                            className="g-2 mb-2",
+                                        ),
                                         dbc.Row(
                                             [
                                                 dbc.Col(dcc.Graph(id="tournament-leaderboard", config=GRAPH_CONFIG), md=6),
@@ -1587,7 +1399,14 @@ def experiment_page() -> html.Div:
                                                         dbc.Label("Seed"),
                                                         dbc.Input(id="human-seed", type="number", value=0, step=1),
                                                     ],
-                                                    md=3,
+                                                    md=2,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Execution error"),
+                                                        dbc.Input(id="human-error-rate", type="number", value=0.0, min=0.0, max=1.0, step=0.01),
+                                                    ],
+                                                    md=2,
                                                 ),
                                             ],
                                             className="g-2",
@@ -1648,8 +1467,34 @@ def experiment_page() -> html.Div:
                                         html.Br(),
                                         html.H5("Custom strategy builder"),
                                         html.P(
-                                            "Create a strategy using simple rules and test it in the Tournament tab.",
+                                            "Compose a policy from readable rules, see exactly how conflicts are resolved, then test it in a tournament.",
                                             className="muted",
+                                        ),
+                                        dbc.Alert(
+                                            [html.Strong("Rule order: "), "base response → retaliation → reputation threshold → endgame → optional noise."],
+                                            color="info",
+                                            className="py-2",
+                                        ),
+                                        dbc.Row(
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Start from a recipe (optional)"),
+                                                    dcc.Dropdown(
+                                                        id="custom-recipe",
+                                                        options=[
+                                                            {"label": "Fresh canvas", "value": "blank"},
+                                                            {"label": "Peacemaker — forgiving majority", "value": "peacemaker"},
+                                                            {"label": "Sentry — three-turn retaliation", "value": "sentry"},
+                                                            {"label": "Chaos Goblin — anti-mirror + noise", "value": "chaos"},
+                                                            {"label": "Late Betrayal — cooperate, then defect", "value": "betrayal"},
+                                                        ],
+                                                        value="blank",
+                                                        clearable=False,
+                                                    ),
+                                                ],
+                                                md=8,
+                                            ),
+                                            className="mb-3",
                                         ),
                                         dbc.Row(
                                             [
@@ -1683,19 +1528,46 @@ def experiment_page() -> html.Div:
                                             [
                                                 dbc.Col(
                                                     [
-                                                        dbc.Label("Rule toggles"),
+                                                        dbc.Label("Base response"),
+                                                        dcc.Dropdown(
+                                                            id="custom-response-mode",
+                                                            options=[
+                                                                {"label": "Fixed opening move", "value": "fixed"},
+                                                                {"label": "Mirror opponent (Tit-for-Tat)", "value": "tft"},
+                                                                {"label": "Oppose opponent (Anti-Tit-for-Tat)", "value": "anti_tft"},
+                                                                {"label": "Cooperative majority", "value": "soft_majority"},
+                                                                {"label": "Strict majority", "value": "hard_majority"},
+                                                            ],
+                                                            value="fixed",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Safety rules"),
                                                         dbc.Checklist(
                                                             id="custom-toggles",
                                                             options=[
-                                                                {"label": "Tit-for-tat (mirror last opponent move)", "value": "tft"},
                                                                 {"label": "Grudge (defect forever after any opponent defect)", "value": "grudge"},
+                                                                {"label": "Enable reputation threshold", "value": "threshold"},
                                                             ],
                                                             value=[],
                                                         ),
                                                     ],
-                                                    md=12,
+                                                    md=6,
                                                 ),
                                             ]
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Short-memory retaliation (defect if opponent defected within N moves; 0 = disabled)"),
+                                                    dcc.Slider(id="custom-retaliation-window", min=0, max=10, step=1, value=0, tooltip={"placement": "bottom"}),
+                                                ]
+                                            )
                                         ),
                                         html.Br(),
                                         dbc.Row(
@@ -1765,6 +1637,38 @@ def experiment_page() -> html.Div:
                                             ],
                                             className="g-3",
                                         ),
+                                        html.H5("Live strategy preview"),
+                                        html.P("Test the current controls before saving. Green cells cooperate; red cells defect.", className="muted"),
+                                        dbc.Row(
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Preview opponent"),
+                                                    dcc.Dropdown(
+                                                        id="custom-preview-scenario",
+                                                        options=[
+                                                            {"label": "Always cooperate", "value": "cooperate"},
+                                                            {"label": "Always defect", "value": "defect"},
+                                                            {"label": "Alternator", "value": "alternator"},
+                                                            {"label": "Single betrayal", "value": "betrayal"},
+                                                            {"label": "Defection burst", "value": "burst"},
+                                                        ],
+                                                        value="betrayal",
+                                                        clearable=False,
+                                                    ),
+                                                ],
+                                                md=5,
+                                            ),
+                                            className="mb-2",
+                                        ),
+                                        dcc.Graph(id="custom-preview-figure", config=GRAPH_CONFIG),
+                                        html.Div(id="custom-preview-summary", className="muted mb-2"),
+                                        dash_table.DataTable(
+                                            id="custom-preview-table",
+                                            page_size=10,
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={"fontFamily": "system-ui", "fontSize": 12, "padding": "6px"},
+                                        ),
+                                        html.Hr(),
                                         html.Br(),
                                         dbc.Row(
                                             [
@@ -1839,6 +1743,49 @@ def display_page(pathname: str):
 # ----------------------------
 # Profile callbacks
 # ----------------------------
+
+
+@callback(
+    Output("matchup-matrix", "figure"),
+    Input("matchup-matrix-metric", "value"),
+    Input("sim-settings", "data"),
+)
+def update_matchup_matrix(metric: str, sim_settings: dict):
+    settings = dict(sim_settings or {})
+    results = get_results(
+        int(settings.get("rounds_per_match", 10) or 10),
+        int(settings.get("repetitions", 10) or 10),
+        int(settings.get("seed", 0) or 0),
+        bool(settings.get("horizon_known", True)),
+    )
+    matrix = _pairwise_metric_frame(results, metric)
+    labels = {
+        "points_per_round": "Points per round",
+        "cooperation_rate": "Cooperation rate",
+        "score_margin": "Score margin",
+        "win_rate": "Win rate",
+    }
+    selected = metric if metric in labels else "points_per_round"
+    if matrix.empty:
+        return px.scatter(title="No matchup data available")
+    if selected == "score_margin":
+        bound = max(1.0, float(matrix.abs().max().max()))
+        color_scale = "RdBu_r"
+        color_range = [-bound, bound]
+    else:
+        color_scale = "Viridis"
+        color_range = [0, 5] if selected == "points_per_round" else [0, 1]
+    figure = px.imshow(
+        matrix,
+        color_continuous_scale=color_scale,
+        zmin=color_range[0],
+        zmax=color_range[1],
+        aspect="auto",
+        labels={"x": "Opponent", "y": "Strategy", "color": labels[selected]},
+        title=f"Pairwise matchup matrix — {labels[selected].lower()}",
+    )
+    figure.update_layout(height=760, margin=dict(l=10, r=10, t=60, b=10))
+    return figure
 
 
 @callback(
@@ -2280,6 +2227,93 @@ def sync_sim_settings(rounds, reps, seed, horizon_known, current):
 
 
 @callback(
+    Output("experiment-config-download", "data"),
+    Output("experiment-config-status", "children"),
+    Output("tournament-strategies", "value", allow_duplicate=True),
+    Output("tournament-strategies", "options", allow_duplicate=True),
+    Output("tournament-rounds", "value"),
+    Output("tournament-reps", "value"),
+    Output("tournament-seed", "value"),
+    Output("tournament-horizon-known", "value"),
+    Output("tournament-self-play", "value"),
+    Output("tournament-error-rate", "value"),
+    Output("custom-strategies", "data", allow_duplicate=True),
+    Input("experiment-config-export", "n_clicks"),
+    Input("experiment-config-upload", "contents"),
+    State("tournament-strategies", "value"),
+    State("tournament-rounds", "value"),
+    State("tournament-reps", "value"),
+    State("tournament-seed", "value"),
+    State("tournament-horizon-known", "value"),
+    State("tournament-self-play", "value"),
+    State("tournament-error-rate", "value"),
+    State("custom-strategies", "data"),
+    prevent_initial_call=True,
+)
+def transfer_experiment_config(_export, upload_contents, strategies, rounds, reps, seed, horizon_known, include_self_play, execution_error_rate, custom_strategies):
+    no_change = (dash.no_update,) * 9
+    if dash.ctx.triggered_id == "experiment-config-export":
+        payload = {
+            "schema_version": 1,
+            "strategies": list(strategies or []),
+            "rounds_per_match": int(rounds or 10),
+            "repetitions": int(reps or 10),
+            "seed": int(seed or 0),
+            "horizon_known": bool(horizon_known),
+            "include_self_play": bool(include_self_play),
+            "execution_error_rate": float(execution_error_rate or 0.0),
+            "custom_strategies": list(custom_strategies or []),
+        }
+        return dcc.send_string(json.dumps(payload, indent=2), "prisoners-dilemma-experiment.json"), "Experiment exported.", *no_change
+
+    try:
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 100_000:
+            raise ValueError("configuration file exceeds 100 KB")
+        payload = json.loads(decoded.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("unsupported or missing schema_version")
+        imported_custom = payload.get("custom_strategies", [])
+        if not isinstance(imported_custom, list):
+            raise ValueError("custom_strategies must be a list")
+        custom_map = {
+            str(item["name"]): item["config"]
+            for item in imported_custom
+            if isinstance(item, dict) and "name" in item and "config" in item
+        }
+        imported_strategies = [str(name) for name in payload.get("strategies", [])]
+        validated = init_tournament_state(
+            strategy_names=imported_strategies,
+            rounds_per_match=int(payload.get("rounds_per_match", 10)),
+            repetitions=int(payload.get("repetitions", 10)),
+            seed=int(payload.get("seed", 0)),
+            horizon_known=bool(payload.get("horizon_known", True)),
+            include_self_play=bool(payload.get("include_self_play", False)),
+            execution_error_rate=float(payload.get("execution_error_rate", 0.0)),
+            custom_strategies=custom_map,
+        )
+        normalized_custom = [{"name": name, "config": config} for name, config in validated["custom_strategies"].items()]
+        options = [{"label": name, "value": name} for name in list_strategy_names()]
+        options.extend({"label": f"{item['name']} (custom)", "value": item["name"]} for item in normalized_custom)
+        return (
+            dash.no_update,
+            "Experiment imported. Review the settings, then press Start.",
+            validated["strategy_names"],
+            options,
+            validated["rounds_per_match"],
+            validated["repetitions"],
+            validated["seed"],
+            validated["horizon_known"],
+            validated["include_self_play"],
+            validated["execution_error_rate"],
+            normalized_custom,
+        )
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Import failed: {exc}", *no_change
+
+
+@callback(
     Output("tournament-strategies", "value"),
     Output("tournament-random-feedback", "children"),
     Input("tournament-random-10", "n_clicks"),
@@ -2335,15 +2369,18 @@ def pick_random_strategies(n_clicks, current_value, seed):
     Input("tournament-reset", "n_clicks"),
     Input("tournament-summary-close", "n_clicks"),
     Input("tournament-interval", "n_intervals"),
+    Input("tournament-rank-metric", "value"),
     State("tournament-strategies", "value"),
     State("tournament-rounds", "value"),
     State("tournament-reps", "value"),
     State("tournament-seed", "value"),
     State("custom-strategies", "data"),
     State("tournament-horizon-known", "value"),
+    State("tournament-self-play", "value"),
+    State("tournament-error-rate", "value"),
     State("tournament-state", "data"),
 )
-def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds, reps, seed, custom_strategies, horizon_known, state):
+def tournament_controller(_start, _stop, _reset, _close, _n, rank_metric, strategies, rounds, reps, seed, custom_strategies, horizon_known, include_self_play, execution_error_rate, state):
 
     def _summary_children(current_state: dict) -> html.Div:
         names = list(current_state.get("strategy_names", []))
@@ -2360,9 +2397,9 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             c = int(coop.get(s, 0))
             coop_rate = (c / rp) if rp else 0.0
             w = int(wins.get(s, 0))
-            l = int(losses.get(s, 0))
+            loss_count = int(losses.get(s, 0))
             t = int(ties.get(s, 0))
-            matches = w + l + t
+            matches = w + loss_count + t
             win_pct = (w / matches) if matches else 0.0
 
             total_points = int(totals.get(s, 0))
@@ -2373,7 +2410,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                     "strategy": s,
                     "total_points": total_points,
                     "wins": w,
-                    "losses": l,
+                    "losses": loss_count,
                     "ties": t,
                     "win_pct": win_pct,
                     "ppt": ppt,
@@ -2476,18 +2513,25 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
         total_matches = int(current_state.get("total_matches", 1)) or 1
         pct = int(round(100 * (matches_done / total_matches)))
 
-        totals = current_state.get("totals", {})
-        leaderboard = (
-            pd.DataFrame([{"strategy": k, "total_points": v} for k, v in totals.items()])
-            .sort_values("total_points", ascending=True)
-            .reset_index(drop=True)
-        )
+        metrics = _tournament_metrics_frame(current_state)
+        metric = rank_metric if rank_metric in {"points_per_round", "total_points", "win_rate", "cooperation_rate"} else "points_per_round"
+        metric_labels = {
+            "points_per_round": "Points per round",
+            "total_points": "Total points",
+            "win_rate": "Win rate",
+            "cooperation_rate": "Cooperation rate",
+        }
+        leaderboard = metrics.sort_values(metric, ascending=True).reset_index(drop=True)
         leaderboard_fig = px.bar(
             leaderboard,
-            x="total_points",
+            x=metric,
             y="strategy",
+            color="cooperation_rate",
+            color_continuous_scale="RdYlGn",
+            range_color=[0, 1],
             orientation="h",
-            title="Live leaderboard (total points)",
+            title=f"Live leaderboard ({metric_labels[metric].lower()})",
+            hover_data=["total_points", "points_per_round", "win_rate", "cooperation_rate", "rounds_played"],
         )
         leaderboard_fig.update_layout(
             height=420,
@@ -2496,26 +2540,25 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             plot_bgcolor="rgba(0,0,0,0)",
         )
 
-        # Live counts: cooperate vs defect per strategy
-        rp_map = current_state.get("rounds_played", {}) or {}
-        coop_map = current_state.get("cooperate", {}) or {}
-        order = leaderboard.sort_values("total_points", ascending=False)["strategy"].tolist() if not leaderboard.empty else list((current_state.get("strategy_names", []) or []))
+        # Normalize moves so traversal order does not make early strategies look larger.
+        order = leaderboard.sort_values(metric, ascending=False)["strategy"].tolist()
         move_rows = []
-        for s in order:
-            rp = int(rp_map.get(s, 0))
-            c = int(coop_map.get(s, 0))
-            d = max(0, rp - c)
-            move_rows.append({"strategy": s, "move": "Cooperate", "count": c})
-            move_rows.append({"strategy": s, "move": "Defect", "count": d})
+        indexed = metrics.set_index("strategy") if not metrics.empty else pd.DataFrame()
+        for strategy in order:
+            row = indexed.loc[strategy]
+            move_rows.append({"strategy": strategy, "move": "Cooperate", "rate": row["cooperation_rate"], "count": round(row["cooperation_rate"] * row["rounds_played"])})
+            move_rows.append({"strategy": strategy, "move": "Defect", "rate": row["defection_rate"], "count": round(row["defection_rate"] * row["rounds_played"])})
         moves_df = pd.DataFrame(move_rows)
         moves_fig = px.bar(
             moves_df,
-            x="count",
+            x="rate",
             y="strategy",
             color="move",
-            barmode="group",
+            barmode="stack",
             orientation="h",
-            title="Live move counts (Cooperate vs Defect)",
+            title="Move mix (normalized per strategy)",
+            color_discrete_map={"Cooperate": "#2ca02c", "Defect": "#d62728"},
+            hover_data={"count": True, "rate": ":.1%"},
         )
         moves_fig.update_layout(
             height=420,
@@ -2525,6 +2568,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             legend_title_text="Move",
         )
         moves_fig.update_yaxes(autorange="reversed")
+        moves_fig.update_xaxes(range=[0, 1], tickformat=".0%", title="Share of moves")
 
         # Build match-level timeline series (fallback to a single snapshot if timeline empty)
         timeline = list(current_state.get("timeline", []))
@@ -2633,26 +2677,35 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
         )
         wl_fig.for_each_annotation(lambda a: a.update(text=a.text.replace("metric=", "").title()))
 
-        pie_df = pd.DataFrame([{"strategy": k, "total_points": int(v)} for k, v in totals.items()])
-        points_pie_fig = px.pie(
-            pie_df,
-            names="strategy",
-            values="total_points",
-            title="Share of total points",
-            hole=0.45,
+        points_pie_fig = px.scatter(
+            metrics,
+            x="cooperation_rate",
+            y="points_per_round",
+            color="win_rate",
+            size="matches_played",
+            size_max=28,
+            text="strategy",
+            color_continuous_scale="Viridis",
+            range_color=[0, 1],
+            title="Efficiency vs cooperation",
+            hover_data=["total_points", "rounds_played", "matches_played"],
         )
         points_pie_fig.update_layout(
             height=520,
             margin=dict(l=10, r=10, t=60, b=10),
             paper_bgcolor="rgba(0,0,0,0)",
         )
+        points_pie_fig.update_xaxes(range=[0, 1], tickformat=".0%", title="Cooperation rate")
+        points_pie_fig.update_yaxes(range=[0, 5], title="Points per round")
+        points_pie_fig.update_traces(textposition="top center")
 
         recent_raw = list(current_state.get("recent", []))
         recent = recent_raw
         cols = []
 
         # Support compact recent format from game_logic:
-        # [rep, i, j, round, move1, move2, points1, points2]
+        # v1: [rep, i, j, round, move1, move2, points1, points2]
+        # v2 adds intended moves before executed moves.
         if recent_raw and isinstance(recent_raw[0], (list, tuple)):
             names = list(current_state.get("strategy_names", []) or [])
 
@@ -2662,7 +2715,11 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             recent = []
             for r in recent_raw:
                 try:
-                    rep_i, i, j, rnd, m1, m2, p1, p2 = r
+                    if len(r) == 10:
+                        rep_i, i, j, rnd, im1, im2, m1, m2, p1, p2 = r
+                    else:
+                        rep_i, i, j, rnd, m1, m2, p1, p2 = r
+                        im1, im2 = m1, m2
                     i = int(i)
                     j = int(j)
                     recent.append(
@@ -2671,6 +2728,8 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                             "strategy_1": names[i] if 0 <= i < len(names) else str(i),
                             "strategy_2": names[j] if 0 <= j < len(names) else str(j),
                             "round": int(rnd),
+                            "intended_move_1": _mv(im1),
+                            "intended_move_2": _mv(im2),
                             "move_1": _mv(m1),
                             "move_2": _mv(m2),
                             "points_1": int(p1),
@@ -2775,6 +2834,8 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                 repetitions=int(reps or 10),
                 seed=int(seed or 0),
                 horizon_known=bool(horizon_known),
+                include_self_play=bool(include_self_play),
+                execution_error_rate=float(execution_error_rate or 0.0),
                 recent_limit=recent_limit,
                 timeline_limit=timeline_limit,
                 timeline_stride=timeline_stride,
@@ -2861,12 +2922,13 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
     State("human-opponent", "value"),
     State("human-rounds", "value"),
     State("human-seed", "value"),
+    State("human-error-rate", "value"),
     State("sim-settings", "data"),
     State("custom-strategies", "data"),
     State("human-match-state", "data"),
     prevent_initial_call=True,
 )
-def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, custom_strategies, state):
+def play_human(new, coop, defect, reset, opponent, rounds, seed, execution_error_rate, sim_settings, custom_strategies, state):
     triggered = dash.ctx.triggered_id
 
     if triggered == "human-reset":
@@ -2882,6 +2944,7 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, c
                 rounds=int(rounds or 10),
                 seed=int(seed or 0),
                 horizon_known=bool(horizon_known),
+                execution_error_rate=float(execution_error_rate or 0.0),
                 custom_strategies=custom_map,
             )
         except Exception as e:
@@ -2932,12 +2995,165 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, c
         )
     else:
         score_df = pd.DataFrame(cum_h + cum_o)
-    fig = px.line(score_df, x="round", y="score", color="player", title="Cumulative score")
-    fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.14,
+        subplot_titles=("Cumulative score and lead", "Round-by-round decisions"),
+    )
+    for player, player_rows in score_df.groupby("player"):
+        fig.add_trace(
+            go.Scatter(x=player_rows["round"], y=player_rows["score"], name=str(player), mode="lines+markers"),
+            row=1,
+            col=1,
+        )
+    if events:
+        rounds_x = [int(event["round"]) for event in events]
+        lead = []
+        running_lead = 0
+        for event in events:
+            running_lead += int(event["human_points"]) - int(event["opponent_points"])
+            lead.append(running_lead)
+        fig.add_trace(
+            go.Scatter(
+                x=rounds_x,
+                y=lead,
+                name="Your lead",
+                mode="lines",
+                line={"dash": "dot", "color": "#9467bd"},
+                hovertemplate="Round %{x}<br>Lead: %{y:+d}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        decision_z = [
+            [0 if event["human_move"] == "cooperate" else 1 for event in events],
+            [0 if event["opponent_move"] == "cooperate" else 1 for event in events],
+        ]
+        decision_text = [
+            [
+                ("C" if event["human_move"] == "cooperate" else "D")
+                if event.get("intended_human_move", event["human_move"]) == event["human_move"]
+                else f"{event['intended_human_move'][0].upper()}→{event['human_move'][0].upper()}"
+                for event in events
+            ],
+            [
+                ("C" if event["opponent_move"] == "cooperate" else "D")
+                if event.get("intended_opponent_move", event["opponent_move"]) == event["opponent_move"]
+                else f"{event['intended_opponent_move'][0].upper()}→{event['opponent_move'][0].upper()}"
+                for event in events
+            ],
+        ]
+        fig.add_trace(
+            go.Heatmap(
+                x=rounds_x,
+                y=["You", str(state.get("opponent"))],
+                z=decision_z,
+                text=decision_text,
+                texttemplate="%{text}",
+                colorscale=[[0, "#2ca02c"], [0.499, "#2ca02c"], [0.5, "#d62728"], [1, "#d62728"]],
+                showscale=False,
+                hovertemplate="Round %{x}<br>%{y}: %{text}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+    fig.update_layout(height=500, margin=dict(l=10, r=10, t=70, b=10), hovermode="x unified")
+    fig.update_xaxes(title_text="Round", row=2, col=1)
+    fig.update_yaxes(title_text="Score / lead", row=1, col=1)
 
     cols = [{"name": c, "id": c} for c in (events[0].keys() if events else [])]
     disabled = done
     return state, disabled, disabled, status, fig, cols, events[::-1]
+
+
+@callback(
+    Output("custom-start-move", "value"),
+    Output("custom-response-mode", "value"),
+    Output("custom-toggles", "value"),
+    Output("custom-retaliation-window", "value"),
+    Output("custom-defect-threshold", "value"),
+    Output("custom-min-history", "value"),
+    Output("custom-endgame-after", "value"),
+    Output("custom-noise", "value"),
+    Input("custom-recipe", "value"),
+)
+def apply_custom_recipe(recipe):
+    """Translate approachable recipes into the builder's explicit rule controls."""
+    recipes = {
+        "peacemaker": ("cooperate", "soft_majority", ["threshold"], 0, 0.65, 4, 0, 0.0),
+        "sentry": ("cooperate", "fixed", [], 3, 0.5, 3, 0, 0.0),
+        "chaos": ("defect", "anti_tft", [], 0, 0.5, 3, 0, 0.12),
+        "betrayal": ("cooperate", "fixed", [], 0, 0.5, 3, 12, 0.0),
+    }
+    return recipes.get(recipe, ("cooperate", "fixed", [], 0, 0.5, 3, 0, 0.0))
+
+
+@callback(
+    Output("custom-preview-figure", "figure"),
+    Output("custom-preview-summary", "children"),
+    Output("custom-preview-table", "columns"),
+    Output("custom-preview-table", "data"),
+    Input("custom-preview-scenario", "value"),
+    Input("custom-start-move", "value"),
+    Input("custom-response-mode", "value"),
+    Input("custom-toggles", "value"),
+    Input("custom-retaliation-window", "value"),
+    Input("custom-defect-threshold", "value"),
+    Input("custom-min-history", "value"),
+    Input("custom-endgame-after", "value"),
+    Input("custom-noise", "value"),
+)
+def update_custom_preview(scenario, start_move, response_mode, toggles, retaliation_window, threshold, min_history, endgame, noise):
+    scripts = {
+        "cooperate": ["cooperate"] * 12,
+        "defect": ["defect"] * 12,
+        "alternator": ["cooperate", "defect"] * 6,
+        "betrayal": ["cooperate"] * 4 + ["defect"] + ["cooperate"] * 7,
+        "burst": ["cooperate"] * 3 + ["defect"] * 3 + ["cooperate"] * 6,
+    }
+    opponent_moves = scripts.get(str(scenario), scripts["betrayal"])
+    enabled = set(toggles or [])
+    config = {
+        "start_move": "cooperate" if start_move == "cooperate" else "defect",
+        "response_mode": response_mode or "fixed",
+        "use_tft": False,
+        "use_grudge": "grudge" in enabled,
+        "retaliation_window": int(retaliation_window or 0),
+        "threshold_enabled": "threshold" in enabled,
+        "defect_rate_threshold": float(threshold if threshold is not None else 1.0),
+        "min_history": int(min_history or 0),
+        "endgame_after_turn": int(endgame or 0),
+        "noise": float(noise or 0.0),
+    }
+    rows = _custom_preview_rows(config, opponent_moves)
+    rounds = [row["round"] for row in rows]
+    z = [
+        [0 if row["custom_move"] == "cooperate" else 1 for row in rows],
+        [0 if row["opponent_move"] == "cooperate" else 1 for row in rows],
+    ]
+    text_values = [["C" if value == 0 else "D" for value in row] for row in z]
+    figure = go.Figure(
+        go.Heatmap(
+            x=rounds,
+            y=["Your strategy", "Scripted opponent"],
+            z=z,
+            text=text_values,
+            texttemplate="%{text}",
+            colorscale=[[0, "#2ca02c"], [0.499, "#2ca02c"], [0.5, "#d62728"], [1, "#d62728"]],
+            showscale=False,
+            hovertemplate="Round %{x}<br>%{y}: %{text}<extra></extra>",
+        )
+    )
+    figure.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=35), xaxis_title="Round")
+    total = sum(row["custom_points"] for row in rows)
+    opponent_total = sum(row["opponent_points"] for row in rows)
+    cooperation = sum(row["custom_move"] == "cooperate" for row in rows) / len(rows)
+    summary = f"Preview score: {total}–{opponent_total} · Cooperation: {cooperation:.0%} · Seeded noise preview is repeatable."
+    columns = [{"name": name.replace("_", " ").title(), "id": name} for name in rows[0]]
+    return figure, summary, columns, rows
 
 
 @callback(
@@ -2951,7 +3167,9 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, c
     Input("custom-clear", "n_clicks"),
     State("custom-strategy-name", "value"),
     State("custom-start-move", "value"),
+    State("custom-response-mode", "value"),
     State("custom-toggles", "value"),
+    State("custom-retaliation-window", "value"),
     State("custom-defect-threshold", "value"),
     State("custom-min-history", "value"),
     State("custom-endgame-after", "value"),
@@ -2964,7 +3182,9 @@ def manage_custom_strategies(
     _clear,
     name,
     start_move,
+    response_mode,
     toggles,
+    retaliation_window,
     defect_threshold,
     min_history,
     endgame_after,
@@ -2991,15 +3211,17 @@ def manage_custom_strategies(
                 {
                     "name": s.get("name"),
                     "start_move": cfg.get("start_move"),
-                    "use_tft": bool(cfg.get("use_tft")),
+                    "response": cfg.get("response_mode", "fixed"),
                     "use_grudge": bool(cfg.get("use_grudge")),
+                    "retaliation_window": cfg.get("retaliation_window", 0),
+                    "threshold_enabled": bool(cfg.get("threshold_enabled")),
                     "defect_rate_threshold": cfg.get("defect_rate_threshold"),
                     "min_history": cfg.get("min_history"),
                     "endgame_after_turn": cfg.get("endgame_after_turn"),
                     "noise": cfg.get("noise"),
                 }
             )
-        cols = [{"name": c, "id": c} for c in (rows[0].keys() if rows else ["name", "start_move", "use_tft", "use_grudge", "defect_rate_threshold", "min_history", "endgame_after_turn", "noise"])]
+        cols = [{"name": c, "id": c} for c in (rows[0].keys() if rows else ["name", "start_move", "response", "use_grudge", "retaliation_window", "threshold_enabled", "defect_rate_threshold", "min_history", "endgame_after_turn", "noise"])]
         return cols, rows
 
     triggered = dash.ctx.triggered_id
@@ -3022,8 +3244,11 @@ def manage_custom_strategies(
         toggles = set(toggles or [])
         cfg = {
             "start_move": "cooperate" if start_move == "cooperate" else "defect",
-            "use_tft": ("tft" in toggles),
+            "response_mode": response_mode or "fixed",
+            "use_tft": False,
             "use_grudge": ("grudge" in toggles),
+            "retaliation_window": int(retaliation_window or 0),
+            "threshold_enabled": ("threshold" in toggles),
             "defect_rate_threshold": float(defect_threshold if defect_threshold is not None else 1.0),
             "min_history": int(min_history or 0),
             "endgame_after_turn": int(endgame_after or 0),

@@ -10,7 +10,13 @@ The Dash app can call `simulate_tournament()` and build analytics on top.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Callable, Literal, Optional
+
+try:
+    from .strategy_catalog import HORIZON_AWARE_STRATEGIES, canonical_strategy_name
+except ImportError:
+    from strategy_catalog import HORIZON_AWARE_STRATEGIES, canonical_strategy_name  # type: ignore
 
 import pandas as pd
 import random
@@ -18,22 +24,29 @@ import math
 
 Move = Literal["cooperate", "defect"]
 
-_NAME_ALIASES: dict[str, str] = {
-    # Legacy names (kept for backwards compatibility)
-    "ThePushover": "Pushover",
-    "TheThief": "Thief",
-    "ParrotPicker": "Parrot",
-    "KeepingThePeace": "KeepingPeace",
-}
-
+MAX_LIVE_STRATEGIES = 10
+MAX_ROUNDS_PER_MATCH = 1_000
+MAX_REPETITIONS = 1_000
+MAX_STATE_ROWS = 10_000
+MAX_TOURNAMENT_ROUNDS = 5_000_000
 
 def _canonical_strategy_name(name: str) -> str:
-    nm = str(name or "")
-    return _NAME_ALIASES.get(nm, nm)
+    return canonical_strategy_name(name)
+
+
+def _validate_move(move: object, source: str) -> Move:
+    """Return a legal move or fail with enough context to find its source."""
+
+    if move not in ("cooperate", "defect"):
+        raise ValueError(f"{source} returned invalid move {move!r}")
+    return move  # type: ignore[return-value]
 
 
 def payoff(move_1: Move, move_2: Move) -> tuple[int, int]:
     """Return (points_1, points_2) for a single round."""
+
+    move_1 = _validate_move(move_1, "Player 1")
+    move_2 = _validate_move(move_2, "Player 2")
 
     if move_1 == "cooperate" and move_2 == "cooperate":
         return 3, 3
@@ -45,8 +58,12 @@ def payoff(move_1: Move, move_2: Move) -> tuple[int, int]:
 
 
 class Strategy:
-    def __init__(self, name: str):
+    def __init__(self, name: str, rng: Optional[random.Random] = None):
         self.name = name
+        self.rng = rng if rng is not None else random.Random()
+
+    def set_rng(self, rng: random.Random) -> None:
+        self.rng = rng
 
     def play(self, opponent_history: list[Move]) -> Move:
         raise NotImplementedError
@@ -223,6 +240,122 @@ class TitForTwoTats(Strategy):
         return "cooperate"
 
 
+class TwoTitsForTat(Strategy):
+    """Cooperates first, then retaliates twice for each opponent defection."""
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        return "defect" if "defect" in opponent_history[-2:] else "cooperate"
+
+
+class HardTitForTat(Strategy):
+    """Defects if the opponent defected at least once in the previous three rounds."""
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        return "defect" if "defect" in opponent_history[-3:] else "cooperate"
+
+
+class SoftMajority(Strategy):
+    """Cooperates while the opponent has cooperated at least as often as it defected."""
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        cooperations = opponent_history.count("cooperate")
+        defections = opponent_history.count("defect")
+        return "cooperate" if cooperations >= defections else "defect"
+
+
+class HardMajority(Strategy):
+    """Defects unless the opponent has cooperated more often than it defected."""
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        cooperations = opponent_history.count("cooperate")
+        defections = opponent_history.count("defect")
+        return "cooperate" if cooperations > defections else "defect"
+
+
+class Gradual(Strategy):
+    """
+    Punishes each new defection increasingly, then makes two calming cooperations.
+
+    After the opponent's nth defection, adds n rounds to the remaining punishment
+    and then cooperates twice. Defections during punishment extend, rather than
+    replace, the outstanding retaliation.
+    """
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.seen = 0
+        self.opp_defections = 0
+        self.retaliate_left = 0
+        self.calm_left = 0
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if len(opponent_history) > self.seen:
+            new_moves = opponent_history[self.seen :]
+            new_defections = new_moves.count("defect")
+            self.seen = len(opponent_history)
+            if new_defections:
+                for _ in range(new_defections):
+                    self.opp_defections += 1
+                    self.retaliate_left += self.opp_defections
+                self.calm_left = 2
+
+        if self.retaliate_left > 0:
+            self.retaliate_left -= 1
+            return "defect"
+        if self.calm_left > 0:
+            self.calm_left -= 1
+        return "cooperate"
+
+
+class DebtCollector(Strategy):
+    """Keeps a ledger: exploitation creates debt and cooperation repays it."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.seen = 0
+        self.debt = 0
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        for move in opponent_history[self.seen :]:
+            self.debt = max(0, self.debt + (2 if move == "defect" else -1))
+        self.seen = len(opponent_history)
+        if self.debt:
+            self.debt -= 1
+            return "defect"
+        return "cooperate"
+
+
+class PatternHunter(Strategy):
+    """Predicts the opponent from its own observed one-step transitions."""
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if len(opponent_history) < 3:
+            return "cooperate" if not opponent_history else opponent_history[-1]
+        context = opponent_history[-1]
+        followers = [
+            opponent_history[index + 1]
+            for index in range(len(opponent_history) - 1)
+            if opponent_history[index] == context
+        ]
+        defects = followers.count("defect")
+        cooperations = followers.count("cooperate")
+        return "defect" if defects > cooperations else "cooperate"
+
+
+class EntropyBroker(Strategy):
+    """Cooperates with predictable partners and shields against chaotic ones."""
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        window = opponent_history[-8:]
+        if len(window) < 4:
+            return "cooperate" if not window else window[-1]
+        switches = sum(left != right for left, right in zip(window, window[1:]))
+        # Rapid switching is treated as uncertainty rather than as trustworthy reciprocity.
+        if switches >= len(window) - 2:
+            return "defect"
+        return "cooperate" if window.count("cooperate") >= window.count("defect") else "defect"
+
+
 class SuspiciousTitForTat(Strategy):
     """
     Suspicious Tit-for-Tat (STFT): starts with defect, then mirrors the opponent.
@@ -247,7 +380,7 @@ class GenerousTitForTat(Strategy):
         if not opponent_history:
             return "cooperate"
         if opponent_history[-1] == "defect":
-            return "cooperate" if random.random() < self.forgive_prob else "defect"
+            return "cooperate" if self.rng.random() < self.forgive_prob else "defect"
         return "cooperate"
 
 
@@ -266,7 +399,7 @@ class Joss(Strategy):
         if opponent_history[-1] == "defect":
             return "defect"
         # opponent cooperated; sometimes defect anyway
-        return "defect" if random.random() < self.defect_prob else "cooperate"
+        return "defect" if self.rng.random() < self.defect_prob else "cooperate"
 
 
 class Prober(Strategy):
@@ -300,7 +433,7 @@ class Prober(Strategy):
 
 class ImSoRandom(Strategy):
     def play(self, opponent_history: list[Move]) -> Move:
-        return "cooperate" if random.random() < 0.5 else "defect"
+        return "cooperate" if self.rng.random() < 0.5 else "defect"
 
 
 class CalculatedDefector(Strategy):
@@ -420,7 +553,7 @@ class NeverSwitchUp(Strategy):
 
     def play(self, opponent_history: list[Move]) -> Move:
         if self.choice is None:
-            self.choice = "cooperate" if random.random() < 0.5 else "defect"
+            self.choice = "cooperate" if self.rng.random() < 0.5 else "defect"
         return self.choice
 
 
@@ -438,7 +571,7 @@ class RandomPrime(Strategy):
     def play(self, opponent_history: list[Move]) -> Move:
         self.turn += 1
         if _is_prime(self.turn):
-            return "cooperate" if random.random() < 0.5 else "defect"
+            return "cooperate" if self.rng.random() < 0.5 else "defect"
         return "defect"
 
 
@@ -459,7 +592,7 @@ class Fibonacci(Strategy):
     def play(self, opponent_history: list[Move]) -> Move:
         self.turn += 1
         if self.base is None:
-            self.base = "cooperate" if random.random() < 0.5 else "defect"
+            self.base = "cooperate" if self.rng.random() < 0.5 else "defect"
         if _is_fibonacci(self.turn):
             return self.base
         return "defect" if self.base == "cooperate" else "cooperate"
@@ -535,7 +668,7 @@ class LongTermRelationship(Strategy):
         elif combined_rate < (1.0 / 3.0):
             move = "defect"
         else:
-            move = "cooperate" if random.random() < 0.5 else "defect"
+            move = "cooperate" if self.rng.random() < 0.5 else "defect"
 
         self.self_coop += 1 if move == "cooperate" else 0
         return move
@@ -558,13 +691,13 @@ class Parrot(Strategy):
 
         # First move: random
         if self.turn == 1:
-            return "cooperate" if random.random() < 0.5 else "defect"
+            return "cooperate" if self.rng.random() < 0.5 else "defect"
 
         # Then repeat: 5 turns copy, 1 turn random
         pos = (self.turn - 2) % 6  # 0..5
         if pos <= 4:
             return "cooperate" if not opponent_history else opponent_history[-1]
-        return "cooperate" if random.random() < 0.5 else "defect"
+        return "cooperate" if self.rng.random() < 0.5 else "defect"
 
 
 class OneStepBehind(Strategy):
@@ -580,7 +713,7 @@ class OneStepBehind(Strategy):
     def play(self, opponent_history: list[Move]) -> Move:
         self.turn += 1
         if self.turn == 1:
-            return "cooperate" if random.random() < 0.5 else "defect"
+            return "cooperate" if self.rng.random() < 0.5 else "defect"
         if not opponent_history:
             return "cooperate"
         return "defect" if opponent_history[-1] == "cooperate" else "cooperate"
@@ -599,7 +732,7 @@ class FriendlySquare(Strategy):
         self.turn += 1
         if _is_square(self.turn):
             return "cooperate"
-        return "cooperate" if random.random() < 0.5 else "defect"
+        return "cooperate" if self.rng.random() < 0.5 else "defect"
 
 
 class LosingMyMind(Strategy):
@@ -620,8 +753,8 @@ class LosingMyMind(Strategy):
         p = min(1.0, max(0.0, (self.turn - 1) * 0.05))
         if p == 0.0:
             return "cooperate"
-        if random.random() < p:
-            return "cooperate" if random.random() < 0.5 else "defect"
+        if self.rng.random() < p:
+            return "cooperate" if self.rng.random() < 0.5 else "defect"
         return "cooperate"
 
 
@@ -652,7 +785,7 @@ class BadJudgeOfCharacter(Strategy):
 
         if self.mode == "always_defect":
             return "defect"
-        return "cooperate" if random.random() < 0.5 else "defect"
+        return "cooperate" if self.rng.random() < 0.5 else "defect"
 
 
 class DefectiveDeputy(Strategy):
@@ -668,7 +801,7 @@ class DefectiveDeputy(Strategy):
         self.turn += 1
         # Start defect-heavy and ramp to always defect.
         p_defect = min(1.0, 0.65 + 0.02 * (self.turn - 1))
-        return "defect" if random.random() < p_defect else "cooperate"
+        return "defect" if self.rng.random() < p_defect else "cooperate"
 
 
 class PastTrauma(Strategy):
@@ -699,7 +832,7 @@ class Lottery(Strategy):
     def play(self, opponent_history: list[Move]) -> Move:
         self.turn += 1
         if self.total_rounds and self.turn >= int(self.total_rounds):
-            return "cooperate" if random.random() < 0.5 else "defect"
+            return "cooperate" if self.rng.random() < 0.5 else "defect"
         return "defect"
 
 
@@ -767,13 +900,13 @@ class BadDivorce(Strategy):
         if n <= 1:
             self.coop_turn = None
         else:
-            self.coop_turn = random.randint(2, n)
+            self.coop_turn = self.rng.randint(2, n)
 
     def play(self, opponent_history: list[Move]) -> Move:
         self.turn += 1
         if self.coop_turn is None and self.total_rounds is None:
             # Horizon unknown: pick a default one-time cooperate moment.
-            self.coop_turn = random.randint(2, 10)
+            self.coop_turn = self.rng.randint(2, 10)
         return "cooperate" if (self.coop_turn is not None and self.turn == self.coop_turn) else "defect"
 
 
@@ -794,7 +927,7 @@ class RandomStranger(Strategy):
         self.turn += 1
         if self.total_rounds and self.turn >= int(self.total_rounds):
             return "defect"
-        return "cooperate" if random.random() < 0.5 else "defect"
+        return "cooperate" if self.rng.random() < 0.5 else "defect"
 
 
 class MarkedMan(Strategy):
@@ -803,7 +936,7 @@ class MarkedMan(Strategy):
     """
 
     def play(self, opponent_history: list[Move]) -> Move:
-        return "defect" if random.random() < 0.9 else "cooperate"
+        return "defect" if self.rng.random() < 0.9 else "cooperate"
 
 
 class Shootout(Strategy):
@@ -914,6 +1047,14 @@ def make_strategy_factories() -> list[Callable[[], Strategy]]:
         lambda: TitForTat("TitForTat"),
         lambda: WinStayLoseShift("WinStayLoseShift"),
         lambda: TitForTwoTats("TitForTwoTats"),
+        lambda: TwoTitsForTat("TwoTitsForTat"),
+        lambda: HardTitForTat("HardTitForTat"),
+        lambda: SoftMajority("SoftMajority"),
+        lambda: HardMajority("HardMajority"),
+        lambda: Gradual("Gradual"),
+        lambda: DebtCollector("DebtCollector"),
+        lambda: PatternHunter("PatternHunter"),
+        lambda: EntropyBroker("EntropyBroker"),
         lambda: SuspiciousTitForTat("SuspiciousTitForTat"),
         lambda: GenerousTitForTat("GenerousTitForTat"),
         lambda: Joss("Joss"),
@@ -962,6 +1103,8 @@ def simulate_tournament(
     repetitions: int = 30,
     seed: Optional[int] = 0,
     horizon_known: bool = True,
+    include_self_play: bool = False,
+    execution_error_rate: float = 0.0,
 ) -> pd.DataFrame:
     """
     Round-level tournament simulation.
@@ -977,9 +1120,11 @@ def simulate_tournament(
         raise ValueError("rounds_per_match must be > 0")
     if repetitions <= 0:
         raise ValueError("repetitions must be > 0")
+    execution_error_rate = float(execution_error_rate)
+    if not math.isfinite(execution_error_rate) or not 0.0 <= execution_error_rate <= 1.0:
+        raise ValueError("execution_error_rate must be between 0 and 1")
 
-    if seed is not None:
-        random.seed(seed)
+    rng = random.Random(seed)
 
     factories = make_strategy_factories()
     rows: list[dict] = []
@@ -989,17 +1134,17 @@ def simulate_tournament(
             return
         setter = getattr(s, "set_total_rounds", None)
         if callable(setter):
-            try:
-                setter(rounds_per_match)
-            except Exception:
-                # Never let optional metadata crash simulation.
-                pass
+            setter(rounds_per_match)
 
     for rep in range(repetitions):
         for i in range(len(factories)):
-            for j in range(i + 1, len(factories)):
+            for j in range(i if include_self_play else i + 1, len(factories)):
                 s1 = factories[i]()
                 s2 = factories[j]()
+                for strategy in (s1, s2):
+                    setter = getattr(strategy, "set_rng", None)
+                    if callable(setter):
+                        setter(rng)
                 _maybe_set_total_rounds(s1)
                 _maybe_set_total_rounds(s2)
 
@@ -1007,8 +1152,15 @@ def simulate_tournament(
                 history2: list[Move] = []
 
                 for r in range(rounds_per_match):
-                    m1 = s1.play(history2)
-                    m2 = s2.play(history1)
+                    intended_m1 = _validate_move(s1.play(history2), f"Strategy {s1.name!r}")
+                    intended_m2 = _validate_move(s2.play(history1), f"Strategy {s2.name!r}")
+                    m1 = intended_m1
+                    m2 = intended_m2
+                    if execution_error_rate > 0:
+                        if rng.random() < execution_error_rate:
+                            m1 = "defect" if m1 == "cooperate" else "cooperate"
+                        if rng.random() < execution_error_rate:
+                            m2 = "defect" if m2 == "cooperate" else "cooperate"
                     history1.append(m1)
                     history2.append(m2)
 
@@ -1020,6 +1172,8 @@ def simulate_tournament(
                             "round": r,
                             "strategy_1": s1.name,
                             "strategy_2": s2.name,
+                            "intended_move_1": intended_m1,
+                            "intended_move_2": intended_m2,
                             "move_1": m1,
                             "move_2": m2,
                             "points_1": p1,
@@ -1028,7 +1182,7 @@ def simulate_tournament(
                     )
 
     df = pd.DataFrame(rows)
-    for col in ("strategy_1", "strategy_2", "move_1", "move_2"):
+    for col in ("strategy_1", "strategy_2", "intended_move_1", "intended_move_2", "move_1", "move_2"):
         if col in df.columns:
             df[col] = df[col].astype("string")
     return df
@@ -1107,6 +1261,10 @@ def _init_strategy_state(name: str, custom_config: Optional[dict] = None) -> dic
         return {"last_move": "cooperate"}
     if name == "Prober":
         return {"turn": 0, "mode": None}
+    if name == "Gradual":
+        return {"seen": 0, "opp_defections": 0, "retaliate_left": 0, "calm_left": 0}
+    if name == "DebtCollector":
+        return {"seen": 0, "debt": 0}
     if name in {"BadAlternator", "RitualDefection", "TripleThreat", "Pushover", "Thief", "Pattern"}:
         return {"turn": 0}
     if name == "NeverSwitchUp":
@@ -1158,22 +1316,36 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
         state = {**state, "turn": turn}
 
         base_move: Move = "cooperate" if custom.get("start_move") == "cooperate" else "defect"
+        response_mode = str(custom.get("response_mode", "tft" if custom.get("use_tft") else "fixed"))
         use_tft = bool(custom.get("use_tft", False))
         use_grudge = bool(custom.get("use_grudge", False))
+        retaliation_window = int(custom.get("retaliation_window", 0) or 0)
+        threshold_enabled = bool(custom.get("threshold_enabled", int(custom.get("min_history", 0) or 0) > 0))
         min_history = int(custom.get("min_history", 0) or 0)
         threshold = float(custom.get("defect_rate_threshold", 1.0))
         endgame_after = int(custom.get("endgame_after_turn", 0) or 0)
         noise = float(custom.get("noise", 0.0) or 0.0)
 
         move: Move
-        if use_grudge and ("defect" in opponent_history):
-            move = "defect"
-        elif use_tft:
+        if response_mode == "tft" or use_tft:
             move = "cooperate" if not opponent_history else opponent_history[-1]
+        elif response_mode == "anti_tft":
+            move = base_move if not opponent_history else ("defect" if opponent_history[-1] == "cooperate" else "cooperate")
+        elif response_mode in {"soft_majority", "hard_majority"}:
+            cooperations = opponent_history.count("cooperate")
+            defections = opponent_history.count("defect")
+            move = "cooperate" if cooperations >= defections else "defect"
+            if response_mode == "hard_majority" and cooperations == defections:
+                move = "defect"
         else:
             move = base_move
 
-        if len(opponent_history) >= min_history and min_history > 0:
+        if use_grudge and ("defect" in opponent_history):
+            move = "defect"
+        elif retaliation_window > 0 and "defect" in opponent_history[-retaliation_window:]:
+            move = "defect"
+
+        if threshold_enabled and len(opponent_history) >= min_history and min_history > 0:
             defect_rate = opponent_history.count("defect") / float(len(opponent_history) or 1)
             if defect_rate > threshold:
                 move = "defect"
@@ -1203,6 +1375,76 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
         if len(opponent_history) >= 2 and opponent_history[-1] == "defect" and opponent_history[-2] == "defect":
             return "defect", state, rng_state
         return "cooperate", state, rng_state
+    if name == "TwoTitsForTat":
+        return ("defect" if "defect" in opponent_history[-2:] else "cooperate"), state, rng_state
+    if name == "HardTitForTat":
+        return ("defect" if "defect" in opponent_history[-3:] else "cooperate"), state, rng_state
+    if name == "SoftMajority":
+        cooperations = opponent_history.count("cooperate")
+        defections = opponent_history.count("defect")
+        move = "cooperate" if cooperations >= defections else "defect"
+        return move, state, rng_state
+    if name == "HardMajority":
+        cooperations = opponent_history.count("cooperate")
+        defections = opponent_history.count("defect")
+        move = "cooperate" if cooperations > defections else "defect"
+        return move, state, rng_state
+    if name == "Gradual":
+        seen = int(state.get("seen", 0))
+        opp_defections = int(state.get("opp_defections", 0))
+        retaliate_left = int(state.get("retaliate_left", 0))
+        calm_left = int(state.get("calm_left", 0))
+        if len(opponent_history) > seen:
+            new_defections = opponent_history[seen:].count("defect")
+            seen = len(opponent_history)
+            if new_defections:
+                for _ in range(new_defections):
+                    opp_defections += 1
+                    retaliate_left += opp_defections
+                calm_left = 2
+        if retaliate_left > 0:
+            retaliate_left -= 1
+            move = "defect"
+        else:
+            if calm_left > 0:
+                calm_left -= 1
+            move = "cooperate"
+        state = {
+            **state,
+            "seen": seen,
+            "opp_defections": opp_defections,
+            "retaliate_left": retaliate_left,
+            "calm_left": calm_left,
+        }
+        return move, state, rng_state
+    if name == "DebtCollector":
+        seen = int(state.get("seen", 0))
+        debt = int(state.get("debt", 0))
+        for observed in opponent_history[seen:]:
+            debt = max(0, debt + (2 if observed == "defect" else -1))
+        seen = len(opponent_history)
+        if debt:
+            debt -= 1
+            move = "defect"
+        else:
+            move = "cooperate"
+        return move, {**state, "seen": seen, "debt": debt}, rng_state
+    if name == "PatternHunter":
+        if len(opponent_history) < 3:
+            move = "cooperate" if not opponent_history else opponent_history[-1]
+        else:
+            context = opponent_history[-1]
+            followers = [opponent_history[i + 1] for i in range(len(opponent_history) - 1) if opponent_history[i] == context]
+            move = "defect" if followers.count("defect") > followers.count("cooperate") else "cooperate"
+        return move, state, rng_state
+    if name == "EntropyBroker":
+        window = opponent_history[-8:]
+        if len(window) < 4:
+            move = "cooperate" if not window else window[-1]
+        else:
+            switches = sum(left != right for left, right in zip(window, window[1:]))
+            move = "defect" if switches >= len(window) - 2 else ("cooperate" if window.count("cooperate") >= window.count("defect") else "defect")
+        return move, state, rng_state
     if name == "WinStayLoseShift":
         last_move = state.get("last_move", "cooperate")
         if last_move not in ("cooperate", "defect"):
@@ -1265,8 +1507,8 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
     if name == "TripleThreat":
         turn = int(state.get("turn", 0)) + 1
         state = {**state, "turn": turn}
-        cycle_position = turn % 6
-        return ("defect" if 3 <= cycle_position < 6 else "cooperate"), state, rng_state
+        cycle_position = (turn - 1) % 6
+        return ("cooperate" if cycle_position < 3 else "defect"), state, rng_state
 
     if name == "Pushover":
         turn = int(state.get("turn", 0)) + 1
@@ -1586,8 +1828,102 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
             rng_state,
         )
 
-    # Fallback: treat unknown as always cooperate (safe default)
-    return "cooperate", state, rng_state
+    raise ValueError(f"Unknown strategy {name!r}")
+
+
+def _normalize_custom_strategies(custom_strategies: object) -> dict[str, dict]:
+    """Validate and canonicalize custom strategy definitions."""
+
+    if custom_strategies is None:
+        return {}
+    if not isinstance(custom_strategies, Mapping):
+        raise ValueError("custom_strategies must be a mapping of names to configurations")
+
+    built_ins = set(list_strategy_names())
+    normalized: dict[str, dict] = {}
+    allowed_fields = {
+        "start_move",
+        "use_tft",
+        "use_grudge",
+        "response_mode",
+        "retaliation_window",
+        "threshold_enabled",
+        "defect_rate_threshold",
+        "min_history",
+        "endgame_after_turn",
+        "noise",
+    }
+    for raw_name, config in custom_strategies.items():
+        name = _canonical_strategy_name(str(raw_name).strip())
+        if not name:
+            raise ValueError("Custom strategy names must not be empty")
+        if name in built_ins:
+            raise ValueError(f"Custom strategy name {name!r} conflicts with a built-in strategy")
+        if name in normalized:
+            raise ValueError(f"Duplicate custom strategy name after alias normalization: {name!r}")
+        if not isinstance(config, Mapping):
+            raise ValueError(f"Custom strategy {name!r} configuration must be a dictionary")
+
+        unknown_fields = sorted(set(config) - allowed_fields)
+        if unknown_fields:
+            rendered = ", ".join(repr(field) for field in unknown_fields)
+            raise ValueError(f"Custom strategy {name!r} has unknown field(s): {rendered}")
+
+        for field in ("min_history", "endgame_after_turn", "retaliation_window"):
+            if field in config and isinstance(config[field], bool):
+                raise ValueError(f"Custom strategy {name!r} {field} must be an integer")
+        for field in ("defect_rate_threshold", "noise"):
+            if field in config and isinstance(config[field], bool):
+                raise ValueError(f"Custom strategy {name!r} {field} must be a number")
+
+        try:
+            min_history = int(config.get("min_history", 0) or 0)
+            endgame_after = int(config.get("endgame_after_turn", 0) or 0)
+            retaliation_window = int(config.get("retaliation_window", 0) or 0)
+            threshold = float(config.get("defect_rate_threshold", 1.0))
+            noise = float(config.get("noise", 0.0) or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Custom strategy {name!r} has invalid numeric settings") from exc
+        if min_history < 0 or endgame_after < 0 or retaliation_window < 0:
+            raise ValueError(f"Custom strategy {name!r} turn settings must be non-negative")
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"Custom strategy {name!r} defect_rate_threshold must be between 0 and 1")
+        if not math.isfinite(noise) or not 0.0 <= noise <= 1.0:
+            raise ValueError(f"Custom strategy {name!r} noise must be between 0 and 1")
+        start_move = config.get("start_move", "defect")
+        if start_move not in ("cooperate", "defect"):
+            raise ValueError(f"Custom strategy {name!r} start_move must be 'cooperate' or 'defect'")
+        response_mode = config.get("response_mode", "tft" if config.get("use_tft", False) else "fixed")
+        if response_mode not in {"fixed", "tft", "anti_tft", "soft_majority", "hard_majority"}:
+            raise ValueError(f"Custom strategy {name!r} response_mode is invalid")
+        for field in ("use_tft", "use_grudge", "threshold_enabled"):
+            if field in config and not isinstance(config[field], bool):
+                raise ValueError(f"Custom strategy {name!r} {field} must be a boolean")
+        normalized[name] = {
+            "start_move": start_move,
+            "use_tft": bool(config.get("use_tft", False)),
+            "use_grudge": bool(config.get("use_grudge", False)),
+            "response_mode": response_mode,
+            "retaliation_window": retaliation_window,
+            "threshold_enabled": bool(config.get("threshold_enabled", min_history > 0)),
+            "defect_rate_threshold": threshold,
+            "min_history": min_history,
+            "endgame_after_turn": endgame_after,
+            "noise": noise,
+        }
+    return normalized
+
+
+def _validate_strategy_selection(names: list[str], custom_strategies: dict[str, dict]) -> None:
+    if len(names) != len(set(names)):
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        rendered = ", ".join(repr(name) for name in duplicates)
+        raise ValueError(f"Duplicate strategy name(s) after alias normalization: {rendered}")
+    known = set(list_strategy_names()) | set(custom_strategies)
+    unknown = sorted(set(names) - known)
+    if unknown:
+        rendered = ", ".join(repr(name) for name in unknown)
+        raise ValueError(f"Unknown strategy name(s): {rendered}")
 
 
 def init_tournament_state(
@@ -1597,6 +1933,8 @@ def init_tournament_state(
     repetitions: int,
     seed: int = 0,
     horizon_known: bool = True,
+    include_self_play: bool = False,
+    execution_error_rate: float = 0.0,
     recent_limit: int = 200,
     timeline_limit: int = 400,
     timeline_stride: int = 1,
@@ -1609,33 +1947,52 @@ def init_tournament_state(
     names = [_canonical_strategy_name(str(s)) for s in (strategy_names or [])]
     if len(names) < 2:
         raise ValueError("Select at least 2 strategies to run a tournament.")
+    if len(names) > MAX_LIVE_STRATEGIES:
+        raise ValueError(f"strategy_names must contain at most {MAX_LIVE_STRATEGIES} strategies")
 
     rounds_per_match = int(rounds_per_match)
     repetitions = int(repetitions)
     seed = int(seed)
     horizon_known = bool(horizon_known)
-    timeline_stride = max(1, int(timeline_stride))
-    if rounds_per_match <= 0:
-        raise ValueError("rounds_per_match must be > 0")
-    if repetitions <= 0:
-        raise ValueError("repetitions must be > 0")
+    include_self_play = bool(include_self_play)
+    execution_error_rate = float(execution_error_rate)
+    recent_limit = int(recent_limit)
+    timeline_limit = int(timeline_limit)
+    timeline_stride = int(timeline_stride)
+    if not 1 <= rounds_per_match <= MAX_ROUNDS_PER_MATCH:
+        raise ValueError(f"rounds_per_match must be between 1 and {MAX_ROUNDS_PER_MATCH}")
+    if not 1 <= repetitions <= MAX_REPETITIONS:
+        raise ValueError(f"repetitions must be between 1 and {MAX_REPETITIONS}")
+    if not 0 <= recent_limit <= MAX_STATE_ROWS:
+        raise ValueError(f"recent_limit must be between 0 and {MAX_STATE_ROWS}")
+    if not 0 <= timeline_limit <= MAX_STATE_ROWS:
+        raise ValueError(f"timeline_limit must be between 0 and {MAX_STATE_ROWS}")
+    if not 1 <= timeline_stride <= MAX_STATE_ROWS:
+        raise ValueError(f"timeline_stride must be between 1 and {MAX_STATE_ROWS}")
+    if not math.isfinite(execution_error_rate) or not 0.0 <= execution_error_rate <= 1.0:
+        raise ValueError("execution_error_rate must be between 0 and 1")
+
+    custom_strategies = _normalize_custom_strategies(custom_strategies)
+    _validate_strategy_selection(names, custom_strategies)
 
     n = len(names)
-    total_matches = repetitions * (n * (n - 1) // 2)
+    total_matches = repetitions * (n * (n + 1) // 2 if include_self_play else n * (n - 1) // 2)
+    total_rounds = total_matches * rounds_per_match
+    if total_rounds > MAX_TOURNAMENT_ROUNDS:
+        raise ValueError(f"tournament workload must not exceed {MAX_TOURNAMENT_ROUNDS} rounds")
 
-    custom_strategies = dict(custom_strategies or {})
-
-    # Initialize first pair (0,1)
+    # Initialize the first diagonal or off-diagonal pairing.
     s1 = names[0]
-    s2 = names[1]
+    initial_j = 0 if include_self_play else 1
+    s2 = names[initial_j]
 
     s1_state = _init_strategy_state(s1, custom_strategies.get(s1))
     s2_state = _init_strategy_state(s2, custom_strategies.get(s2))
     # Provide match length only when explicitly enabled (horizon known).
     # Used by endgame-based strategies like BadDivorce / RandomStranger.
-    if horizon_known and s1 in {"BadDivorce", "RandomStranger", "Lottery"}:
+    if horizon_known and s1 in HORIZON_AWARE_STRATEGIES:
         s1_state["match_total_rounds"] = rounds_per_match
-    if horizon_known and s2 in {"BadDivorce", "RandomStranger", "Lottery"}:
+    if horizon_known and s2 in HORIZON_AWARE_STRATEGIES:
         s2_state["match_total_rounds"] = rounds_per_match
 
     return {
@@ -1644,12 +2001,14 @@ def init_tournament_state(
         "repetitions": repetitions,
         "seed": seed,
         "horizon_known": horizon_known,
+        "include_self_play": include_self_play,
+        "execution_error_rate": execution_error_rate,
         "rng_state": seed & 0xFFFFFFFF,
-        "recent_limit": int(recent_limit),
+        "recent_limit": recent_limit,
         # iteration state
         "rep": 0,
         "i": 0,
-        "j": 1,
+        "j": initial_j,
         "round": 0,
         "s1": s1,
         "s2": s2,
@@ -1669,17 +2028,16 @@ def init_tournament_state(
         "match_ties": {name: 0 for name in names},
         "matches_done": 0,
         "total_matches": total_matches,
-        # Recent rounds are stored in a compact format to reduce Dash JSON payload size:
-        # [rep, i, j, round, move1, move2, points1, points2]
-        # where i/j are indices into `strategy_names` and move is 0=cooperate, 1=defect.
-        "recent_format": "compact_v1",
-        "recent_columns": ["rep", "strategy_1", "strategy_2", "round", "move_1", "move_2", "points_1", "points_2"],
+        # Recent rounds are compact: intended and executed moves are encoded as
+        # 0=cooperate/1=defect and i/j index into `strategy_names`.
+        "recent_format": "compact_v2",
+        "recent_columns": ["rep", "strategy_1", "strategy_2", "round", "intended_move_1", "intended_move_2", "move_1", "move_2", "points_1", "points_2"],
         "recent": [],
         # match-level timeline snapshots (for live charts)
-        "timeline_limit": int(timeline_limit),
+        "timeline_limit": timeline_limit,
         # Capture a snapshot every N matches to keep state compact.
         # (Dash stores pass state back/forth; large timelines hurt performance.)
-        "timeline_stride": int(timeline_stride),
+        "timeline_stride": timeline_stride,
         "timeline": [],
         # UI helpers
         "summary_shown": False,
@@ -1693,18 +2051,19 @@ def _advance_pair(state: dict) -> dict:
     i = int(state["i"])
     j = int(state["j"])
     rep = int(state["rep"])
+    include_self_play = bool(state.get("include_self_play", False))
 
     # next pair
     j += 1
     if j >= n:
         i += 1
-        j = i + 1
+        j = i if include_self_play else i + 1
 
     # end of rep
-    if i >= n - 1:
+    if i >= (n if include_self_play else n - 1):
         rep += 1
         i = 0
-        j = 1
+        j = 0 if include_self_play else 1
 
     state["rep"] = rep
     state["i"] = i
@@ -1725,9 +2084,9 @@ def _advance_pair(state: dict) -> dict:
     # but only if the horizon is considered "known".
     if bool(state.get("horizon_known", True)):
         rpm = int(state.get("rounds_per_match", 0) or 0)
-        if s1 in {"BadDivorce", "RandomStranger", "Lottery"}:
+        if s1 in HORIZON_AWARE_STRATEGIES:
             state["s1_state"]["match_total_rounds"] = rpm
-        if s2 in {"BadDivorce", "RandomStranger", "Lottery"}:
+        if s2 in HORIZON_AWARE_STRATEGIES:
             state["s2_state"]["match_total_rounds"] = rpm
     state["history1"] = []
     state["history2"] = []
@@ -1765,6 +2124,18 @@ def step_tournament(state: dict, *, max_rounds: int = 500) -> dict:
 
         m1, s1_state, rng_state = play_strategy(s1, history2, state["s1_state"], int(state["rng_state"]))
         m2, s2_state, rng_state = play_strategy(s2, history1, state["s2_state"], rng_state)
+        intended_m1 = _validate_move(m1, f"Strategy {s1!r}")
+        intended_m2 = _validate_move(m2, f"Strategy {s2!r}")
+        m1 = intended_m1
+        m2 = intended_m2
+        error_rate = float(state.get("execution_error_rate", 0.0))
+        if error_rate > 0:
+            error_draw, rng_state = _lcg_float01(rng_state)
+            if error_draw < error_rate:
+                m1 = "defect" if m1 == "cooperate" else "cooperate"
+            error_draw, rng_state = _lcg_float01(rng_state)
+            if error_draw < error_rate:
+                m2 = "defect" if m2 == "cooperate" else "cooperate"
 
         state["s1_state"] = s1_state
         state["s2_state"] = s2_state
@@ -1789,7 +2160,9 @@ def step_tournament(state: dict, *, max_rounds: int = 500) -> dict:
         j = int(state.get("j", 0))
         m1c = 0 if m1 == "cooperate" else 1
         m2c = 0 if m2 == "cooperate" else 1
-        state["recent"].append([int(state["rep"]), i, j, int(state["round"]) + 1, m1c, m2c, int(p1), int(p2)])
+        im1c = 0 if intended_m1 == "cooperate" else 1
+        im2c = 0 if intended_m2 == "cooperate" else 1
+        state["recent"].append([int(state["rep"]), i, j, int(state["round"]) + 1, im1c, im2c, m1c, m2c, int(p1), int(p2)])
         if len(state["recent"]) > recent_limit:
             state["recent"] = state["recent"][-recent_limit:]
 
@@ -1844,6 +2217,7 @@ def init_human_match_state(
     rounds: int = 10,
     seed: int = 0,
     horizon_known: bool = True,
+    execution_error_rate: float = 0.0,
     custom_strategies: Optional[dict[str, dict]] = None,
 ) -> dict:
     """
@@ -1854,18 +2228,23 @@ def init_human_match_state(
     rounds = int(rounds)
     seed = int(seed)
     horizon_known = bool(horizon_known)
-    if rounds <= 0:
-        raise ValueError("rounds must be > 0")
+    execution_error_rate = float(execution_error_rate)
+    if not 1 <= rounds <= MAX_ROUNDS_PER_MATCH:
+        raise ValueError(f"rounds must be between 1 and {MAX_ROUNDS_PER_MATCH}")
+    if not math.isfinite(execution_error_rate) or not 0.0 <= execution_error_rate <= 1.0:
+        raise ValueError("execution_error_rate must be between 0 and 1")
 
-    custom_strategies = dict(custom_strategies or {})
+    custom_strategies = _normalize_custom_strategies(custom_strategies)
+    _validate_strategy_selection([opponent], custom_strategies)
     opp_state = _init_strategy_state(opponent, custom_strategies.get(opponent))
-    if horizon_known and opponent in {"BadDivorce", "RandomStranger", "Lottery"}:
+    if horizon_known and opponent in HORIZON_AWARE_STRATEGIES:
         opp_state["match_total_rounds"] = rounds
     return {
         "opponent": opponent,
         "rounds": rounds,
         "seed": seed,
         "horizon_known": horizon_known,
+        "execution_error_rate": execution_error_rate,
         "rng_state": seed & 0xFFFFFFFF,
         "custom_strategies": custom_strategies,
         "opponent_state": opp_state,
@@ -1887,11 +2266,22 @@ def step_human_match(state: dict, *, human_move: Move) -> dict:
     if not state or state.get("done"):
         return state
 
-    human_move = "cooperate" if human_move == "cooperate" else "defect"
+    intended_human_move = _validate_move(human_move, "Human player")
 
     opponent = state["opponent"]
     rng_state = int(state["rng_state"])
     opp_move, opp_state, rng_state = play_strategy(opponent, state["human_history"], state["opponent_state"], rng_state)
+    intended_opp_move = _validate_move(opp_move, f"Strategy {opponent!r}")
+    human_move = intended_human_move
+    opp_move = intended_opp_move
+    error_rate = float(state.get("execution_error_rate", 0.0))
+    if error_rate > 0:
+        error_draw, rng_state = _lcg_float01(rng_state)
+        if error_draw < error_rate:
+            human_move = "defect" if human_move == "cooperate" else "cooperate"
+        error_draw, rng_state = _lcg_float01(rng_state)
+        if error_draw < error_rate:
+            opp_move = "defect" if opp_move == "cooperate" else "cooperate"
 
     state["rng_state"] = rng_state
     state["opponent_state"] = opp_state
@@ -1908,6 +2298,8 @@ def step_human_match(state: dict, *, human_move: Move) -> dict:
     state["events"].append(
         {
             "round": int(state["round"]),
+            "intended_human_move": intended_human_move,
+            "intended_opponent_move": intended_opp_move,
             "human_move": human_move,
             "opponent_move": opp_move,
             "human_points": int(p_h),
