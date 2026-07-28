@@ -2,7 +2,11 @@ import unittest
 
 import pandas as pd
 
+<<<<<<< HEAD
 from pages.app import _custom_preview_rows, _game_format_notice, _pairwise_metric_frame, _tournament_metrics_frame
+=======
+from pages.app import _custom_preview_rows, _pairwise_metric_frame, _tournament_metrics_frame
+>>>>>>> origin/main
 
 
 class TournamentVisualizationTests(unittest.TestCase):
@@ -67,6 +71,7 @@ class TournamentVisualizationTests(unittest.TestCase):
         )
         self.assertEqual([row["custom_move"] for row in rows], ["cooperate", "cooperate", "defect"])
         self.assertEqual(sum(row["custom_points"] for row in rows), 8)
+<<<<<<< HEAD
         self.assertIn("Tit-for-Tat", rows[2]["base_rule"])
         self.assertEqual(rows[2]["noise_flip"], "No")
 
@@ -98,6 +103,8 @@ class TournamentVisualizationTests(unittest.TestCase):
         self.assertIn("self-play", variant_text)
         self.assertIn("execution errors", variant_text)
         self.assertEqual(variant_color, "warning")
+=======
+>>>>>>> origin/main
 
 
 if __name__ == "__main__":
