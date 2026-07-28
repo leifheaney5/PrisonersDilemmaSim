@@ -24,6 +24,10 @@ try:
         init_human_match_state,
         init_tournament_state,
         _init_strategy_state,
+<<<<<<< HEAD
+        explain_custom_strategy_decision,
+=======
+>>>>>>> origin/main
         list_strategy_names,
         payoff,
         play_strategy,
@@ -38,6 +42,10 @@ except ImportError:
         init_human_match_state,
         init_tournament_state,
         _init_strategy_state,
+<<<<<<< HEAD
+        explain_custom_strategy_decision,
+=======
+>>>>>>> origin/main
         list_strategy_names,
         payoff,
         play_strategy,
@@ -214,6 +222,7 @@ def navbar_links() -> list[dbc.NavLink]:
 
     return [
         link("Overview", "/"),
+        link("Learn", "/learn"),
         link("Profiles", "/profiles"),
         link("Experiment", "/experiment"),
     ]
@@ -277,7 +286,15 @@ def _custom_preview_rows(config: dict, opponent_moves: list[str], seed: int = 0)
     rows = []
     rng_state = seed & 0xFFFFFFFF
     for round_number, opponent_move in enumerate(opponent_moves, start=1):
+<<<<<<< HEAD
+        turn = int(state.get("turn", 0)) + 1
+        move, next_rng_state, trace = explain_custom_strategy_decision(config, history, turn, rng_state)
+        engine_move, state, rng_state = play_strategy(name, history, state, rng_state)
+        if engine_move != move or rng_state != next_rng_state:
+            raise RuntimeError("Custom preview trace diverged from the strategy engine")
+=======
         move, state, rng_state = play_strategy(name, history, state, rng_state)
+>>>>>>> origin/main
         player_points, opponent_points = payoff(move, opponent_move)
         rows.append(
             {
@@ -286,10 +303,52 @@ def _custom_preview_rows(config: dict, opponent_moves: list[str], seed: int = 0)
                 "opponent_move": opponent_move,
                 "custom_points": player_points,
                 "opponent_points": opponent_points,
+<<<<<<< HEAD
+                "base_rule": trace["base_rule"],
+                "safety_rule": trace["safety_rule"],
+                "threshold_rule": trace["threshold_rule"],
+                "endgame_rule": trace["endgame_rule"],
+                "noise_flip": "Yes" if trace["noise_flip"] else "No",
+=======
+>>>>>>> origin/main
             }
         )
         history.append(opponent_move)
     return rows
+<<<<<<< HEAD
+
+
+def _game_format_notice(include_self_play: bool = False, execution_error_rate: float = 0.0) -> tuple[str, str]:
+    """Describe whether controls preserve the app's classic tournament format."""
+    variations = []
+    if include_self_play:
+        variations.append("self-play adds same-strategy pairings")
+    if float(execution_error_rate or 0.0) > 0:
+        variations.append("execution errors may flip intended moves")
+    if not variations:
+        return "Classic IPD format: unique strategy pairings, deterministic execution of intended moves.", "success"
+    return "Experimental variant: " + "; ".join(variations) + ". Payoffs and legal actions remain unchanged.", "warning"
+
+
+def _payoff_lesson_result(player_move: str, opponent_move: str) -> dict[str, object]:
+    """Return the score and plain-language explanation for one legal round."""
+    player_points, opponent_points = payoff(player_move, opponent_move)
+    labels = {
+        ("cooperate", "cooperate"): ("Mutual cooperation", "Both players accept the reward for cooperating."),
+        ("cooperate", "defect"): ("You were exploited", "You cooperated while the opponent took the larger defection payoff."),
+        ("defect", "cooperate"): ("You exploited the opponent", "You defected while the opponent cooperated."),
+        ("defect", "defect"): ("Mutual defection", "Both players avoided the sucker payoff, but both earned less than under mutual cooperation."),
+    }
+    title, explanation = labels[(player_move, opponent_move)]
+    return {
+        "title": title,
+        "player_points": player_points,
+        "opponent_points": opponent_points,
+        "combined_points": player_points + opponent_points,
+        "explanation": explanation,
+    }
+=======
+>>>>>>> origin/main
 
 app.layout = html.Div(
     id="app-shell",
@@ -321,6 +380,7 @@ app.layout = html.Div(
                         dbc.Nav(
                             [
                                 dbc.NavItem(dbc.NavLink("Overview", href="/", active="exact", external_link=False)),
+                                dbc.NavItem(dbc.NavLink("Learn", href="/learn", active="exact", external_link=False)),
                                 dbc.NavItem(dbc.NavLink("Profiles", href="/profiles", active="exact", external_link=False)),
                                 dbc.NavItem(dbc.NavLink("Experiment", href="/experiment", active="exact", external_link=False)),
                                 dbc.NavItem(
@@ -545,7 +605,7 @@ def about_page() -> html.Div:
                                                 ),
                                                 html.P(
                                                     "This is why Iterated Prisoner’s Dilemma became a classic testbed in game theory and evolutionary thinking: "
-                                                    "it’s a simple rule set that still produces rich, surprising behavior.",
+                                                    "its small set of rules can produce many different patterns of behavior.",
                                                     className="muted mb-0",
                                                 ),
                                             ]
@@ -749,6 +809,183 @@ def about_page() -> html.Div:
     )
 
 
+def learn_page() -> html.Div:
+    move_options = [
+        {"label": "Cooperate", "value": "cooperate"},
+        {"label": "Defect", "value": "defect"},
+    ]
+    return html.Div(
+        [
+            html.Section(
+                [
+                    html.Div("LEARN", className="learn-kicker"),
+                    html.H1("Why cooperation is difficult", className="learn-title"),
+                    html.P(
+                        "The Prisoner’s Dilemma compares individual incentives with the outcome produced when both players follow them.",
+                        className="learn-intro",
+                    ),
+                    html.Div(
+                        [
+                            html.A("The one-round game", href="#one-round", className="learn-anchor"),
+                            html.A("Repeated play", href="#repeated-play", className="learn-anchor"),
+                            html.A("Mistakes and forgiveness", href="#mistakes", className="learn-anchor"),
+                            html.A("Interpretation", href="#interpretation", className="learn-anchor"),
+                        ],
+                        className="learn-nav",
+                    ),
+                ],
+                className="learn-hero",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            html.Section(
+                                [
+                                    html.Div("1", className="lesson-number"),
+                                    html.H2("The one-round game", id="one-round"),
+                                    html.P(
+                                        "Each player chooses without seeing the other player’s choice. The two choices determine both scores.",
+                                    ),
+                                    dbc.Row(
+                                        [
+                                            dbc.Col(
+                                                [dbc.Label("Your move"), dcc.Dropdown(id="learn-player-move", options=move_options, value="cooperate", clearable=False)],
+                                                md=6,
+                                            ),
+                                            dbc.Col(
+                                                [dbc.Label("Opponent move"), dcc.Dropdown(id="learn-opponent-move", options=move_options, value="cooperate", clearable=False)],
+                                                md=6,
+                                            ),
+                                        ],
+                                        className="g-3",
+                                    ),
+                                    html.Div(id="learn-payoff-result", className="learn-result"),
+                                    html.H3("Why defection dominates", className="mt-4"),
+                                    html.Ul(
+                                        [
+                                            html.Li("Against cooperation, defection scores 5 instead of 3."),
+                                            html.Li("Against defection, defection scores 1 instead of 0."),
+                                            html.Li("Defection gives the larger immediate payoff in either case."),
+                                        ]
+                                    ),
+                                    dbc.Alert(
+                                        "If both players defect, each receives 1 point. Mutual cooperation would give each player 3 points. The individually preferred action produces the lower combined score when both players choose it.",
+                                        color="primary",
+                                        className="mt-3",
+                                    ),
+                                ],
+                                className="lesson-card",
+                            ),
+                            html.Section(
+                                [
+                                    html.Div("2", className="lesson-number"),
+                                    html.H2("What repeated play changes", id="repeated-play"),
+                                    html.P(
+                                        "A defection can earn an immediate advantage, but the opponent can respond in later rounds. A strategy must consider both the current payoff and the effect of its choice on future play."
+                                    ),
+                                    dbc.Row(
+                                        [
+                                            dbc.Col([html.Strong("Reciprocity"), html.P("Respond to cooperation with cooperation and to defection with defection.")], md=4),
+                                            dbc.Col([html.Strong("Punishment"), html.P("Make exploitation costly in later rounds.")], md=4),
+                                            dbc.Col([html.Strong("Forgiveness"), html.P("Return to cooperation after a conflict instead of retaliating forever.")], md=4),
+                                        ],
+                                        className="concept-grid g-3",
+                                    ),
+                                    html.P(
+                                        "Knowing the final round can also matter. Some strategies change their behavior when no future response is possible. The Strategy Lab labels this setting as match length visibility."
+                                    ),
+                                    dbc.Button("Open the Strategy Lab", href="/experiment", color="primary", outline=True),
+                                ],
+                                className="lesson-card",
+                            ),
+                            html.Section(
+                                [
+                                    html.Div("3", className="lesson-number"),
+                                    html.H2("Mistakes and forgiveness", id="mistakes"),
+                                    html.P(
+                                        "An intended cooperation can be executed as a defection when errors are enabled. The opponent sees the executed move and may retaliate."
+                                    ),
+                                    html.Ol(
+                                        [
+                                            html.Li("Player A intends to cooperate, but an error changes the move to defection."),
+                                            html.Li("Player B responds to the observed defection."),
+                                            html.Li("Player A may treat that response as a new defection."),
+                                            html.Li("Without a recovery rule, retaliation can continue."),
+                                        ]
+                                    ),
+                                    html.P(
+                                        "The app stores intended and executed moves separately. This makes accidental defections visible in match histories and charts."
+                                    ),
+                                    dbc.Button("Run an experiment with errors", href="/experiment", color="primary", outline=True),
+                                ],
+                                className="lesson-card",
+                            ),
+                            html.Section(
+                                [
+                                    html.Div("4", className="lesson-number"),
+                                    html.H2("How to interpret a result", id="interpretation"),
+                                    html.P("A high score answers a narrow question: how well did this strategy score under these settings and opponents?"),
+                                    dbc.Table(
+                                        [
+                                            html.Thead(html.Tr([html.Th("Measure"), html.Th("What it describes"), html.Th("What it does not establish")])),
+                                            html.Tbody(
+                                                [
+                                                    html.Tr([html.Td("Points per round"), html.Td("Payoff efficiency"), html.Td("Fairness or moral value")]),
+                                                    html.Tr([html.Td("Win rate"), html.Td("How often a strategy outscored its opponent"), html.Td("Combined benefit")]),
+                                                    html.Tr([html.Td("Cooperation rate"), html.Td("How often the strategy cooperated"), html.Td("Whether cooperation was effective")]),
+                                                    html.Tr([html.Td("Score margin"), html.Td("Competitive advantage"), html.Td("Stability across seeds")]),
+                                                ]
+                                            ),
+                                        ],
+                                        bordered=True,
+                                        responsive=True,
+                                        size="sm",
+                                    ),
+                                    dbc.Alert(
+                                        "The simulator compares defined decision rules under a defined payoff table. A tournament winner is not automatically the fairest or most useful rule outside the simulation.",
+                                        color="warning",
+                                    ),
+                                ],
+                                className="lesson-card",
+                            ),
+                        ],
+                        lg=9,
+                    ),
+                    dbc.Col(
+                        html.Aside(
+                            [
+                                html.H3("Terms"),
+                                html.Dl(
+                                    [
+                                        html.Dt("Action"), html.Dd("One choice to cooperate or defect."),
+                                        html.Dt("Strategy"), html.Dd("A rule for choosing actions over time."),
+                                        html.Dt("Dominant action"), html.Dd("An action with a better immediate payoff for every opponent action."),
+                                        html.Dt("Combined payoff"), html.Dd("The sum of both players’ scores."),
+                                        html.Dt("Stochastic"), html.Dd("Uses probability when selecting at least some moves."),
+                                    ]
+                                ),
+                                html.H3("Sources", className="mt-4"),
+                                html.Ul(
+                                    [
+                                        html.Li(html.A("Stanford Encyclopedia of Philosophy", href="https://plato.stanford.edu/entries/prisoner-dilemma/", target="_blank")),
+                                        html.Li(html.A("Axelrod, The Evolution of Cooperation", href="https://doi.org/10.1126/science.7466396", target="_blank")),
+                                        html.Li(html.A("Nowak, Five Rules for the Evolution of Cooperation", href="https://doi.org/10.1126/science.1133755", target="_blank")),
+                                    ]
+                                ),
+                            ],
+                            className="learn-sidebar",
+                        ),
+                        lg=3,
+                    ),
+                ],
+                className="g-4 mt-1",
+            ),
+        ],
+        className="learn-page",
+    )
+
+
 def donate_page() -> html.Div:
     return html.Div(
         [
@@ -771,7 +1008,7 @@ def donate_page() -> html.Div:
                         ),
                         html.Hr(),
                         html.P(
-                            "Thank you — your support helps me keep improving the simulator and adding new features.",
+                            "Thank you. Your support helps cover maintenance and future development.",
                             className="muted",
                         ),
                     ]
@@ -1115,10 +1352,25 @@ def experiment_page() -> html.Div:
             dbc.Card(
                 dbc.CardBody(
                     [
-                        html.H3("Run an experiment (real-time)"),
-                        html.P(
-                            "Run tournaments incrementally (live) or play a match yourself against a strategy.",
-                            className="muted",
+                        html.Div(
+                            [
+                                html.Div("STRATEGY LAB", className="experiment-eyebrow"),
+                                html.H1("Run Prisoner’s Dilemma experiments", className="experiment-title"),
+                                html.P(
+                                    "Choose a mode, set the rules, run the simulation, and review the results.",
+                                    className="experiment-subtitle",
+                                ),
+                            ],
+                            className="experiment-hero",
+                        ),
+                        html.Div(
+                            [
+                                html.Div([html.Span("1"), html.Strong("Choose"), html.Small("Select a lab mode")], className="workflow-step"),
+                                html.Div([html.Span("2"), html.Strong("Configure"), html.Small("Set players and rules")], className="workflow-step"),
+                                html.Div([html.Span("3"), html.Strong("Run"), html.Small("Observe live play")], className="workflow-step"),
+                                html.Div([html.Span("4"), html.Strong("Understand"), html.Small("Review the results")], className="workflow-step"),
+                            ],
+                            className="experiment-workflow",
                         ),
                         html.Hr(),
                         dcc.Store(id="tournament-state"),
@@ -1152,6 +1404,10 @@ def experiment_page() -> html.Div:
                                         "Select your strategies (2 minimum, 10 maximum).",
                                             color="info",
                                             className="mb-3",
+                                        ),
+                                        html.Div(
+                                            [html.Span("CONFIGURE", className="section-kicker"), html.H4("Build the tournament"), html.P("Select the strategies, rounds, and repetitions. Optional settings are listed separately.", className="muted mb-0")],
+                                            className="lab-section-heading",
                                         ),
                                         dbc.Modal(
                                             [
@@ -1231,8 +1487,15 @@ def experiment_page() -> html.Div:
                                             ],
                                             className="g-2",
                                         ),
+                                        dbc.Alert(
+                                            id="tournament-format-notice",
+                                            children=_game_format_notice()[0],
+                                            color="success",
+                                            className="mt-3 mb-0 py-2",
+                                        ),
                                         html.Br(),
-                                        dbc.Row(
+                                        dbc.Accordion(
+                                            [dbc.AccordionItem(dbc.Row(
                                             [
                                                 dbc.Col(
                                                     [
@@ -1276,6 +1539,8 @@ def experiment_page() -> html.Div:
                                                             min=0.0,
                                                             max=1.0,
                                                             step=0.01,
+<<<<<<< HEAD
+=======
                                                         ),
                                                     ],
                                                     md=4,
@@ -1289,18 +1554,67 @@ def experiment_page() -> html.Div:
                                                                 dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
                                                             ],
                                                             className="btn-row",
+>>>>>>> origin/main
                                                         ),
                                                     ],
-                                                    md=9,
-                                                    className="d-flex align-items-end",
+                                                    md=4,
                                                 ),
                                             ],
                                             className="g-2",
+                                            ), title="Advanced settings · seed, horizon, self-play, and execution errors")],
+                                            start_collapsed=True,
+                                            className="experiment-advanced",
+                                        ),
+                                        html.Div(
+                                            [
+                                                html.Div(
+                                                    [
+                                                        html.Strong("Ready to simulate?"),
+                                                        html.Small(" You can pause safely and resume from the same state.", className="muted"),
+                                                    ],
+                                                    className="run-prompt",
+                                                ),
+                                                html.Div(
+                                                    [
+                                                        dbc.Button("Start experiment", id="tournament-start", color="success"),
+                                                        dbc.Button("Pause", id="tournament-stop", color="secondary", outline=True),
+                                                        dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
+                                                    ],
+                                                    className="btn-row experiment-run-actions",
+                                                ),
+                                            ],
+                                            className="experiment-command-bar",
                                         ),
                                         html.Br(),
                                         html.Div(id="tournament-status", className="muted"),
                                         dbc.Progress(id="tournament-progress", value=0, striped=True, animated=True, className="mt-2"),
                                         html.Br(),
+                                        html.Div(
+                                            [html.Span("UNDERSTAND", className="section-kicker"), html.H4("Live analysis"), html.P("Review scores, decisions, outcomes, and rankings as matches finish.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Rank leaderboard by"),
+                                                        dcc.Dropdown(
+                                                            id="tournament-rank-metric",
+                                                            options=[
+                                                                {"label": "Points per round", "value": "points_per_round"},
+                                                                {"label": "Total points", "value": "total_points"},
+                                                                {"label": "Win rate", "value": "win_rate"},
+                                                                {"label": "Cooperation rate", "value": "cooperation_rate"},
+                                                            ],
+                                                            value="points_per_round",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                            ],
+                                            className="g-2 mb-2",
+                                        ),
                                         dbc.Row(
                                             [
                                                 dbc.Col(
@@ -1373,6 +1687,10 @@ def experiment_page() -> html.Div:
                                     tab_id="tab-human",
                                     children=[
                                         html.Br(),
+                                        html.Div(
+                                            [html.Span("HEAD-TO-HEAD", className="section-kicker"), html.H4("Challenge a strategy"), html.P("Choose your moves round by round and inspect how intention, execution, and score diverge.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
                                         dbc.Row(
                                             [
                                                 dbc.Col(
@@ -1411,6 +1729,12 @@ def experiment_page() -> html.Div:
                                             ],
                                             className="g-2",
                                         ),
+                                        dbc.Alert(
+                                            id="human-format-notice",
+                                            children=_game_format_notice()[0],
+                                            color="success",
+                                            className="mt-3 mb-0 py-2",
+                                        ),
                                         html.Br(),
                                         dbc.Row(
                                             [
@@ -1423,7 +1747,7 @@ def experiment_page() -> html.Div:
                                                                 dbc.Button("Defect", id="human-defect", color="warning", disabled=True),
                                                                 dbc.Button("Reset", id="human-reset", color="danger", outline=True),
                                                             ],
-                                                            className="btn-row",
+                                                            className="btn-row experiment-run-actions",
                                                         ),
                                                     ]
                                                 )
@@ -1465,9 +1789,17 @@ def experiment_page() -> html.Div:
                                     tab_id="tab-builder",
                                     children=[
                                         html.Br(),
+                                        html.Div(
+                                            [html.Span("CREATE", className="section-kicker"), html.H4("Compose a strategy"), html.P("Use a preset or configure each rule yourself.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
                                         html.H5("Custom strategy builder"),
                                         html.P(
+<<<<<<< HEAD
+                                            "Set the rules, preview the resulting decisions, and add the strategy to a tournament.",
+=======
                                             "Compose a policy from readable rules, see exactly how conflicts are resolved, then test it in a tournament.",
+>>>>>>> origin/main
                                             className="muted",
                                         ),
                                         dbc.Alert(
@@ -1482,11 +1814,19 @@ def experiment_page() -> html.Div:
                                                     dcc.Dropdown(
                                                         id="custom-recipe",
                                                         options=[
+<<<<<<< HEAD
+                                                            {"label": "No preset", "value": "blank"},
+                                                            {"label": "Forgiving majority", "value": "peacemaker"},
+                                                            {"label": "Three-turn retaliation", "value": "sentry"},
+                                                            {"label": "Anti-mirror with noise", "value": "chaos"},
+                                                            {"label": "Late defection", "value": "betrayal"},
+=======
                                                             {"label": "Fresh canvas", "value": "blank"},
                                                             {"label": "Peacemaker — forgiving majority", "value": "peacemaker"},
                                                             {"label": "Sentry — three-turn retaliation", "value": "sentry"},
                                                             {"label": "Chaos Goblin — anti-mirror + noise", "value": "chaos"},
                                                             {"label": "Late Betrayal — cooperate, then defect", "value": "betrayal"},
+>>>>>>> origin/main
                                                         ],
                                                         value="blank",
                                                         clearable=False,
@@ -1638,7 +1978,15 @@ def experiment_page() -> html.Div:
                                             className="g-3",
                                         ),
                                         html.H5("Live strategy preview"),
+<<<<<<< HEAD
+                                        html.P(
+                                            "Test the current controls before saving. Green cells cooperate; red cells defect. "
+                                            "The decision trace explains which rule produced every move.",
+                                            className="muted",
+                                        ),
+=======
                                         html.P("Test the current controls before saving. Green cells cooperate; red cells defect.", className="muted"),
+>>>>>>> origin/main
                                         dbc.Row(
                                             dbc.Col(
                                                 [
@@ -1707,11 +2055,13 @@ def experiment_page() -> html.Div:
                                     ],
                                 ),
                             ],
+                            id="experiment-mode-tabs",
                             active_tab="tab-tournament",
+                            className="experiment-mode-tabs",
                         ),
                     ]
                 ),
-                className="glass-card",
+                className="glass-card experiment-shell",
             )
         ]
     )
@@ -1727,6 +2077,8 @@ def experiment_page() -> html.Div:
     Input("url", "pathname"),
 )
 def display_page(pathname: str):
+    if pathname == "/learn":
+        return learn_page()
     if pathname == "/profiles":
         return profiles_page()
     if pathname == "/experiment":
@@ -1738,6 +2090,27 @@ def display_page(pathname: str):
         return donate_page()
     # default: about/overview
     return about_page()
+
+
+@callback(
+    Output("learn-payoff-result", "children"),
+    Input("learn-player-move", "value"),
+    Input("learn-opponent-move", "value"),
+)
+def update_payoff_lesson(player_move: str, opponent_move: str):
+    result = _payoff_lesson_result(player_move, opponent_move)
+    return [
+        html.Div(
+            [
+                html.Div([html.Small("You"), html.Strong(str(result["player_points"]))], className="lesson-score"),
+                html.Div([html.Small("Opponent"), html.Strong(str(result["opponent_points"]))], className="lesson-score"),
+                html.Div([html.Small("Combined"), html.Strong(str(result["combined_points"]))], className="lesson-score"),
+            ],
+            className="lesson-score-row",
+        ),
+        html.H3(str(result["title"]), className="mt-3 mb-1"),
+        html.P(str(result["explanation"]), className="mb-0"),
+    ]
 
 
 # ----------------------------
@@ -1782,7 +2155,11 @@ def update_matchup_matrix(metric: str, sim_settings: dict):
         zmax=color_range[1],
         aspect="auto",
         labels={"x": "Opponent", "y": "Strategy", "color": labels[selected]},
+<<<<<<< HEAD
+        title=f"Pairwise matchup matrix: {labels[selected].lower()}",
+=======
         title=f"Pairwise matchup matrix — {labels[selected].lower()}",
+>>>>>>> origin/main
     )
     figure.update_layout(height=760, margin=dict(l=10, r=10, t=60, b=10))
     return figure
@@ -1821,7 +2198,7 @@ def update_profile(strategy: str, sim_settings: dict):
             html.H6("Origin"),
             html.P(profile.get("origin", "Unknown / not documented.")),
             html.H6("Notes"),
-            html.P(profile.get("notes", "—")),
+            html.P(profile.get("notes", "Not available")),
         ]
     )
 
@@ -2130,7 +2507,7 @@ def export_profile(_csv, _png, _pdf, strategy: str, sim_settings: dict):
     )
 
     report.update_layout(
-        title=f"Profile export — {strategy}",
+        title=f"Profile export: {strategy}",
         height=900,
         margin=dict(l=30, r=20, t=80, b=30),
         paper_bgcolor="#ffffff",
@@ -2338,7 +2715,7 @@ def pick_random_strategies(n_clicks, current_value, seed):
         if len(v) <= 10:
             return v, ""
         trimmed = v[-10:]
-        return trimmed, "Max 10 strategies — trimmed to the most recent 10 selections."
+        return trimmed, "The limit is 10 strategies. The most recent 10 selections were kept."
 
     # Random button
     k = min(10, len(names))
@@ -2420,7 +2797,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, rank_metric, strate
             )
 
         df = pd.DataFrame(rows).sort_values(["total_points", "wins"], ascending=False).reset_index(drop=True)
-        winner = str(df.iloc[0]["strategy"]) if not df.empty else "—"
+        winner = str(df.iloc[0]["strategy"]) if not df.empty else "Not available"
         top3 = df.head(3)["strategy"].tolist() if len(df) >= 3 else df["strategy"].tolist()
 
         # Highlights / tidbits
@@ -2430,7 +2807,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, rank_metric, strate
 
         def _row_str(rdf, label, fmt):
             if rdf.empty:
-                return html.Li([html.Strong(f"{label}: "), "—"])
+                return html.Li([html.Strong(f"{label}: "), "Not available"])
             r = rdf.iloc[0]
             return html.Li([html.Strong(f"{label}: "), fmt(r)])
 
@@ -2750,7 +3127,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, rank_metric, strate
             interval_disabled = True
             status = "Done."
 
-        # Provide a richer status line when possible
+        # Include match details when they are available
         if current_state and not done:
             s1 = current_state.get("s1")
             s2 = current_state.get("s2")
@@ -2759,9 +3136,9 @@ def tournament_controller(_start, _stop, _reset, _close, _n, rank_metric, strate
             rep = int(current_state.get("rep", 0))
             reps_total = int(current_state.get("repetitions", 0))
             if bool(current_state.get("horizon_known", True)):
-                status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r}/{rpm})"
+                status = f"{status} Match {matches_done}/{total_matches} | Repetition {rep+1}/{reps_total}: {s1} vs {s2} (round {r}/{rpm})"
             else:
-                status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r})"
+                status = f"{status} Match {matches_done}/{total_matches} | Repetition {rep+1}/{reps_total}: {s1} vs {s2} (round {r})"
 
         # Modal: show summary once, when the tournament completes
         modal_open = False
@@ -2968,11 +3345,11 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, execution_error
     done = bool(state.get("done"))
 
     if bool(state.get("horizon_known", True)):
-        status = f"Round {r}/{total_r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
+        status = f"Round {r}/{total_r} | You: {human_points} | {state.get('opponent')}: {opp_points}"
     else:
-        status = f"Round {r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
+        status = f"Round {r} | You: {human_points} | {state.get('opponent')}: {opp_points}"
     if done:
-        status += " — Finished."
+        status += " | Finished."
 
     # cumulative score chart
     cum_h = []
@@ -3070,6 +3447,28 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, execution_error
 
 
 @callback(
+<<<<<<< HEAD
+    Output("tournament-format-notice", "children"),
+    Output("tournament-format-notice", "color"),
+    Input("tournament-self-play", "value"),
+    Input("tournament-error-rate", "value"),
+)
+def update_tournament_format_notice(include_self_play, execution_error_rate):
+    return _game_format_notice(bool(include_self_play), float(execution_error_rate or 0.0))
+
+
+@callback(
+    Output("human-format-notice", "children"),
+    Output("human-format-notice", "color"),
+    Input("human-error-rate", "value"),
+)
+def update_human_format_notice(execution_error_rate):
+    return _game_format_notice(False, float(execution_error_rate or 0.0))
+
+
+@callback(
+=======
+>>>>>>> origin/main
     Output("custom-start-move", "value"),
     Output("custom-response-mode", "value"),
     Output("custom-toggles", "value"),

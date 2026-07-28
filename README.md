@@ -2,7 +2,7 @@
 
 **Prisoner’s Dilemma Simulation** is a public-facing web app for exploring the *Iterated* Prisoner’s Dilemma: run tournaments, inspect strategies, compare head‑to‑head behavior, and play matches yourself.
 
-- Learn the basics: [Stanford Encyclopedia of Philosophy — Prisoner’s Dilemma](https://plato.stanford.edu/entries/prisoner-dilemma/)
+- Learn the basics: [Stanford Encyclopedia of Philosophy: Prisoner’s Dilemma](https://plato.stanford.edu/entries/prisoner-dilemma/)
 
 
 ## What you can do
@@ -13,6 +13,38 @@
 - **Compare two strategies** head‑to‑head
 - **Build a custom strategy** (safe rule-based controls) and test it in tournaments
 - **Export results and charts** as CSV / PNG / PDF
+- **Learn the game** through an interactive payoff example and short lessons on repetition, mistakes, and result interpretation
+
+Live tournament charts normalize points and moves by rounds played so partial
+round-robin progress does not favor strategies that happened to play first. The
+dashboard also plots payoff efficiency against cooperation, while human matches
+pair cumulative scores with a round-by-round cooperation/defection ribbon.
+The profile page includes a selectable pairwise matchup matrix for payoff,
+cooperation, win rate, and score margin. The custom builder previews unsaved rules
+against scripted opponents, and complete experiment settings can be exported and
+restored as a versioned JSON file.
+
+The strategy-builder preview also exposes a round-by-round decision trace for its
+base response, safety override, reputation threshold, endgame rule, and noise.
+This makes composed strategies inspectable before they are saved or entered into
+a tournament.
+
+The Experiment page is organized into four steps: **Choose, Configure, Run, and
+Review**. Optional tournament settings are separate from the basic setup. Run
+controls remain visible while results update and adapt to narrow screens.
+
+Tournament and human-match controls can add reproducible execution errors. The
+simulator records both the move a player intended and the move that was actually
+executed, so accidental defections and recovery behavior remain inspectable.
+Live tournaments can also include self-play, adding each strategy's diagonal
+matchup to the usual round robin. Both settings are preserved in exported
+experiment configurations.
+
+The UI labels the default settings as the **Classic IPD format**. Enabling
+self-play or a non-zero execution-error probability displays an **Experimental
+variant** notice so extensions to the app's original unique-pairing,
+error-free format are never mistaken for the baseline game. These variants keep
+the same two legal actions and payoff matrix.
 
 Live tournament charts normalize points and moves by rounds played so partial
 round-robin progress does not favor strategies that happened to play first. The
@@ -35,6 +67,7 @@ experiment configurations.
 | Route | Purpose |
 |------:|---------|
 | `/` | Overview, background, and key concepts |
+| `/learn` | Interactive introduction to incentives, repeated play, mistakes, and interpreting results |
 | `/experiment` | Live tournament runner + “Play a match” + custom strategy builder |
 | `/profiles` | Strategy profiles + analytics + comparisons |
 | `/donate` | PayPal hosted button |

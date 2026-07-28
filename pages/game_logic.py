@@ -1302,6 +1302,83 @@ def _init_strategy_state(name: str, custom_config: Optional[dict] = None) -> dic
     return {}
 
 
+def explain_custom_strategy_decision(
+    custom: dict,
+    opponent_history: list[Move],
+    turn: int,
+    rng_state: int,
+) -> tuple[Move, int, dict[str, object]]:
+    """Evaluate a composed custom policy and return an inspectable rule trace.
+
+    The rule order intentionally matches the builder: base response, safety
+    response, reputation threshold, endgame, then decision noise.
+    """
+    base_move: Move = "cooperate" if custom.get("start_move") == "cooperate" else "defect"
+    response_mode = str(custom.get("response_mode", "tft" if custom.get("use_tft") else "fixed"))
+    use_tft = bool(custom.get("use_tft", False))
+    use_grudge = bool(custom.get("use_grudge", False))
+    retaliation_window = int(custom.get("retaliation_window", 0) or 0)
+    threshold_enabled = bool(custom.get("threshold_enabled", int(custom.get("min_history", 0) or 0) > 0))
+    min_history = int(custom.get("min_history", 0) or 0)
+    threshold = float(custom.get("defect_rate_threshold", 1.0))
+    endgame_after = int(custom.get("endgame_after_turn", 0) or 0)
+    noise = float(custom.get("noise", 0.0) or 0.0)
+
+    if response_mode == "tft" or use_tft:
+        move: Move = "cooperate" if not opponent_history else opponent_history[-1]
+        base_reason = "Tit-for-Tat mirrors the opponent's previous move" if opponent_history else "Tit-for-Tat opens cooperatively"
+    elif response_mode == "anti_tft":
+        move = base_move if not opponent_history else ("defect" if opponent_history[-1] == "cooperate" else "cooperate")
+        base_reason = "Anti-Tit-for-Tat opposes the opponent's previous move" if opponent_history else "Opening move"
+    elif response_mode in {"soft_majority", "hard_majority"}:
+        cooperations = opponent_history.count("cooperate")
+        defections = opponent_history.count("defect")
+        move = "cooperate" if cooperations >= defections else "defect"
+        if response_mode == "hard_majority" and cooperations == defections:
+            move = "defect"
+        base_reason = f"{response_mode.replace('_', ' ').title()} sees {cooperations} cooperation(s) and {defections} defection(s)"
+    else:
+        move = base_move
+        base_reason = f"Fixed base move: {base_move}"
+
+    trace: dict[str, object] = {
+        "base_rule": base_reason,
+        "base_move": move,
+        "safety_rule": "Inactive",
+        "threshold_rule": "Inactive",
+        "endgame_rule": "Inactive",
+        "noise_flip": False,
+    }
+
+    if use_grudge and "defect" in opponent_history:
+        move = "defect"
+        trace["safety_rule"] = "Grudge active after an opponent defection"
+    elif retaliation_window > 0 and "defect" in opponent_history[-retaliation_window:]:
+        move = "defect"
+        trace["safety_rule"] = f"Retaliation active: defection found in the last {retaliation_window} move(s)"
+
+    if threshold_enabled and len(opponent_history) >= min_history and min_history > 0:
+        defect_rate = opponent_history.count("defect") / float(len(opponent_history) or 1)
+        if defect_rate > threshold:
+            move = "defect"
+            trace["threshold_rule"] = f"Active: opponent defection rate {defect_rate:.0%} exceeds {threshold:.0%}"
+        else:
+            trace["threshold_rule"] = f"Checked: opponent defection rate {defect_rate:.0%} does not exceed {threshold:.0%}"
+
+    if endgame_after > 0 and turn >= endgame_after:
+        move = "defect"
+        trace["endgame_rule"] = f"Active from turn {endgame_after}"
+
+    if noise > 0:
+        sample, rng_state = _lcg_float01(rng_state)
+        if sample < noise:
+            move = "defect" if move == "cooperate" else "cooperate"
+            trace["noise_flip"] = True
+
+    trace["final_move"] = move
+    return move, rng_state, trace
+
+
 def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_state: int) -> tuple[Move, dict, int]:
     """
     Stateless-ish strategy execution used by the incremental runner.
@@ -1314,6 +1391,9 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
     if isinstance(custom, dict):
         turn = int(state.get("turn", 0)) + 1
         state = {**state, "turn": turn}
+<<<<<<< HEAD
+        move, rng_state, _trace = explain_custom_strategy_decision(custom, opponent_history, turn, rng_state)
+=======
 
         base_move: Move = "cooperate" if custom.get("start_move") == "cooperate" else "defect"
         response_mode = str(custom.get("response_mode", "tft" if custom.get("use_tft") else "fixed"))
@@ -1359,6 +1439,7 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
             if x < noise:
                 move = "defect" if move == "cooperate" else "cooperate"
 
+>>>>>>> origin/main
         return move, state, rng_state
 
     name = _canonical_strategy_name(name)

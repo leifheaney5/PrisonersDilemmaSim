@@ -2,7 +2,11 @@ import unittest
 
 import pandas as pd
 
+<<<<<<< HEAD
+from pages.app import _custom_preview_rows, _game_format_notice, _pairwise_metric_frame, _tournament_metrics_frame
+=======
 from pages.app import _custom_preview_rows, _pairwise_metric_frame, _tournament_metrics_frame
+>>>>>>> origin/main
 
 
 class TournamentVisualizationTests(unittest.TestCase):
@@ -67,6 +71,40 @@ class TournamentVisualizationTests(unittest.TestCase):
         )
         self.assertEqual([row["custom_move"] for row in rows], ["cooperate", "cooperate", "defect"])
         self.assertEqual(sum(row["custom_points"] for row in rows), 8)
+<<<<<<< HEAD
+        self.assertIn("Tit-for-Tat", rows[2]["base_rule"])
+        self.assertEqual(rows[2]["noise_flip"], "No")
+
+    def test_custom_preview_explains_rule_overrides(self):
+        rows = _custom_preview_rows(
+            {
+                "start_move": "cooperate",
+                "response_mode": "fixed",
+                "retaliation_window": 2,
+                "threshold_enabled": True,
+                "defect_rate_threshold": 0.25,
+                "min_history": 2,
+                "endgame_after_turn": 4,
+                "noise": 0.0,
+            },
+            ["cooperate", "defect", "cooperate", "cooperate"],
+        )
+        self.assertIn("Retaliation active", rows[2]["safety_rule"])
+        self.assertIn("Active", rows[3]["threshold_rule"])
+        self.assertIn("turn 4", rows[3]["endgame_rule"])
+        self.assertEqual(rows[3]["custom_move"], "defect")
+
+    def test_format_notice_distinguishes_classic_and_experimental_modes(self):
+        classic_text, classic_color = _game_format_notice()
+        variant_text, variant_color = _game_format_notice(True, 0.05)
+        self.assertIn("Classic IPD format", classic_text)
+        self.assertEqual(classic_color, "success")
+        self.assertIn("Experimental variant", variant_text)
+        self.assertIn("self-play", variant_text)
+        self.assertIn("execution errors", variant_text)
+        self.assertEqual(variant_color, "warning")
+=======
+>>>>>>> origin/main
 
 
 if __name__ == "__main__":
