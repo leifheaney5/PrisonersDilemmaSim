@@ -1391,7 +1391,55 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
     if isinstance(custom, dict):
         turn = int(state.get("turn", 0)) + 1
         state = {**state, "turn": turn}
+<<<<<<< HEAD
         move, rng_state, _trace = explain_custom_strategy_decision(custom, opponent_history, turn, rng_state)
+=======
+
+        base_move: Move = "cooperate" if custom.get("start_move") == "cooperate" else "defect"
+        response_mode = str(custom.get("response_mode", "tft" if custom.get("use_tft") else "fixed"))
+        use_tft = bool(custom.get("use_tft", False))
+        use_grudge = bool(custom.get("use_grudge", False))
+        retaliation_window = int(custom.get("retaliation_window", 0) or 0)
+        threshold_enabled = bool(custom.get("threshold_enabled", int(custom.get("min_history", 0) or 0) > 0))
+        min_history = int(custom.get("min_history", 0) or 0)
+        threshold = float(custom.get("defect_rate_threshold", 1.0))
+        endgame_after = int(custom.get("endgame_after_turn", 0) or 0)
+        noise = float(custom.get("noise", 0.0) or 0.0)
+
+        move: Move
+        if response_mode == "tft" or use_tft:
+            move = "cooperate" if not opponent_history else opponent_history[-1]
+        elif response_mode == "anti_tft":
+            move = base_move if not opponent_history else ("defect" if opponent_history[-1] == "cooperate" else "cooperate")
+        elif response_mode in {"soft_majority", "hard_majority"}:
+            cooperations = opponent_history.count("cooperate")
+            defections = opponent_history.count("defect")
+            move = "cooperate" if cooperations >= defections else "defect"
+            if response_mode == "hard_majority" and cooperations == defections:
+                move = "defect"
+        else:
+            move = base_move
+
+        if use_grudge and ("defect" in opponent_history):
+            move = "defect"
+        elif retaliation_window > 0 and "defect" in opponent_history[-retaliation_window:]:
+            move = "defect"
+
+        if threshold_enabled and len(opponent_history) >= min_history and min_history > 0:
+            defect_rate = opponent_history.count("defect") / float(len(opponent_history) or 1)
+            if defect_rate > threshold:
+                move = "defect"
+
+        if endgame_after > 0 and turn >= endgame_after:
+            move = "defect"
+
+        # Noise: occasionally flip the decision
+        if noise > 0:
+            x, rng_state = _lcg_float01(rng_state)
+            if x < noise:
+                move = "defect" if move == "cooperate" else "cooperate"
+
+>>>>>>> origin/main
         return move, state, rng_state
 
     name = _canonical_strategy_name(name)

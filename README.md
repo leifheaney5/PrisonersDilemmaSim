@@ -46,6 +46,22 @@ variant** notice so extensions to the app's original unique-pairing,
 error-free format are never mistaken for the baseline game. These variants keep
 the same two legal actions and payoff matrix.
 
+Live tournament charts normalize points and moves by rounds played so partial
+round-robin progress does not favor strategies that happened to play first. The
+dashboard also plots payoff efficiency against cooperation, while human matches
+pair cumulative scores with a round-by-round cooperation/defection ribbon.
+The profile page includes a selectable pairwise matchup matrix for payoff,
+cooperation, win rate, and score margin. The custom builder previews unsaved rules
+against scripted opponents, and complete experiment settings can be exported and
+restored as a versioned JSON file.
+
+Tournament and human-match controls can add reproducible execution errors. The
+simulator records both the move a player intended and the move that was actually
+executed, so accidental defections and recovery behavior remain inspectable.
+Live tournaments can also include self-play, adding each strategy's diagonal
+matchup to the usual round robin. Both settings are preserved in exported
+experiment configurations.
+
 ## Pages / routes
 
 | Route | Purpose |
