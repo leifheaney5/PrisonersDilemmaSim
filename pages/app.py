@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import io
 from functools import lru_cache
+from importlib import import_module
 from pathlib import Path
+import base64
+import json
 import random
 
 import dash
@@ -15,14 +17,32 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import logging
 import time
-from flask import g, redirect, request
+import uuid
+from flask import g, jsonify, redirect, request
+
+_config_module = import_module(f"{__package__}.config" if __package__ else "config")
+APP_ENV = _config_module.APP_ENV
+COMMIT_SHA = _config_module.COMMIT_SHA
+DEPLOYED_AT = _config_module.DEPLOYED_AT
+PAYPAL_CLIENT_ID = _config_module.PAYPAL_CLIENT_ID
+MAX_REQUEST_BYTES = _config_module.MAX_REQUEST_BYTES
+HEAVY_REQUESTS_PER_MINUTE = _config_module.HEAVY_REQUESTS_PER_MINUTE
+public_runtime_metadata = _config_module.public_runtime_metadata
+
+_security_module = import_module(f"{__package__}.security" if __package__ else "security")
+SlidingWindowLimiter = _security_module.SlidingWindowLimiter
+is_heavy_dash_submission = _security_module.is_heavy_dash_submission
 
 try:
     # When running under gunicorn (Render) as a package import.
     from .game_logic import (
         init_human_match_state,
         init_tournament_state,
+        _init_strategy_state,
+        explain_custom_strategy_decision,
         list_strategy_names,
+        payoff,
+        play_strategy,
         simulate_tournament,
         step_human_match,
         step_tournament,
@@ -33,220 +53,80 @@ except ImportError:
     from game_logic import (  # type: ignore
         init_human_match_state,
         init_tournament_state,
+        _init_strategy_state,
+        explain_custom_strategy_decision,
         list_strategy_names,
+        payoff,
+        play_strategy,
         simulate_tournament,
         step_human_match,
         step_tournament,
         strategy_summary,
     )
 
+_robustness_module = import_module(f"{__package__}.robustness" if __package__ else "robustness")
+SeedSweepConfig = _robustness_module.SeedSweepConfig
+run_seed_sweep = _robustness_module.run_seed_sweep
+validate_seed_sweep_result = _robustness_module.validate_seed_sweep_result
 
-# ----------------------------
-# Strategy profiles (metadata)
-# ----------------------------
+_analytics_module = import_module(f"{__package__}.analytics" if __package__ else "analytics")
+perspective_rows = _analytics_module.perspective_rows
+match_level = _analytics_module.match_level
+_tournament_metrics_frame = _analytics_module.tournament_metrics_frame
+_pairwise_metric_frame = _analytics_module.pairwise_metric_frame
+_matchup_replay_frame = _analytics_module.matchup_replay_frame
+_strategy_landscape_frame = _analytics_module.strategy_landscape_frame
 
-STRATEGY_PROFILES: dict[str, dict[str, str]] = {
-    "MrNiceGuy": {
-        "description": "Always cooperates. Baseline for measuring how strategies exploit unconditional cooperation.",
-        "origin": "Project baseline strategy (unconditional cooperator).",
-        "notes": "Scores well against other cooperators, but is heavily exploited by defect-heavy strategies.",
-    },
-    "BadCop": {
-        "description": "Always defects. Baseline for measuring robustness against exploitation.",
-        "origin": "Project baseline strategy (unconditional defector).",
-        "notes": "Often wins short-term vs cooperators; performs poorly in mutual-defection matchups.",
-    },
-    "TitForTat": {
-        "description": "Cooperates first, then copies the opponent’s previous move.",
-        "origin": "Classic strategy popularized by the Axelrod tournaments (submitted by Anatol Rapoport).",
-        "notes": "Typically strong in repeated games: nice, retaliatory, forgiving, and clear.",
-    },
-    "ImSoRandom": {
-        "description": "Randomly cooperates or defects each turn (50/50).",
-        "origin": "Project baseline strategy (stochastic behavior).",
-        "notes": "Useful to test whether strategies handle noise/unpredictability.",
-    },
-    "CalculatedDefector": {
-        "description": "Cooperates unless the opponent defects “too often” (threshold-based).",
-        "origin": "Project-defined heuristic.",
-        "notes": "Designed to tolerate occasional defection but punish sustained defection.",
-    },
-    "HoldingAGrudge": {
-        "description": "Cooperates until the opponent defects once, then defects forever.",
-        "origin": "Project-defined grudge strategy (grim-trigger style).",
-        "notes": "Very punishing; can do well against defectors but can lock into mutual defection after a single defection.",
-    },
-    "ForgiveButDontForget": {
-        "description": "Defects if the opponent’s historical defection rate is high; otherwise cooperates.",
-        "origin": "Project-defined forgiveness heuristic.",
-        "notes": "More forgiving than a pure grudge; still punishes frequent defectors.",
-    },
-    "BadAlternator": {
-        "description": "Alternates cooperate/defect each turn (C, D, C, D...).",
-        "origin": "Project-defined deterministic cycle strategy.",
-        "notes": "Can confuse reactive opponents; performance depends strongly on opponent’s response to alternation.",
-    },
-    "RitualDefection": {
-        "description": "Mostly cooperates, but defects on a fixed schedule (every 5th move).",
-        "origin": "Project-defined periodic strategy.",
-        "notes": "Introduces predictable “ritual” defection; tests opponent retaliation/forgiveness.",
-    },
-    "TripleThreat": {
-        "description": "Defects for a 3-turn block in a 6-turn cycle (CCC DDD repeating).",
-        "origin": "Project-defined cyclic strategy.",
-        "notes": "Creates sustained defection bursts; can trigger long retaliation cycles in grudge-like opponents.",
-    },
-    "Pushover": {
-        "description": "Starts responsive, then eventually gives in and cooperates regardless of the opponent.",
-        "origin": "Project-defined 'softening' strategy.",
-        "notes": "Can reduce long retaliation cycles, but risks being exploited late in the match.",
-    },
-    "Thief": {
-        "description": "Builds cooperation early, then shifts behavior later to try to take advantage.",
-        "origin": "Project-defined 'phase shift' strategy.",
-        "notes": "Useful for studying end-game betrayal and how retaliation-based opponents react.",
-    },
-    "Pattern": {
-        "description": "Repeats a fixed pattern: 3 defects, then 3 cooperates, then repeat (DDD CCC ...).",
-        "origin": "Project-defined deterministic pattern strategy.",
-        "notes": "Predictable by design; tests whether opponents adapt to periodic behavior. (Intentionally distinct from TripleThreat.)",
-    },
-    "NeverSwitchUp": {
-        "description": "Randomly chooses cooperate or defect once, then sticks with it for the entire match.",
-        "origin": "Project-defined commitment strategy (stochastic initialization).",
-        "notes": "A controlled way to test 'committed' behavior vs reactive opponents.",
-    },
-    "WinStayLoseShift": {
-        "description": "Repeats its last move if it was rewarded; otherwise switches (Pavlov / WSLS).",
-        "origin": "Classic IPD baseline (Pavlov / Win‑Stay, Lose‑Shift).",
-        "notes": "Often strong in noisy settings; can quickly return to cooperation after mutual cooperation.",
-    },
-    "TitForTwoTats": {
-        "description": "Cooperates by default; defects only after two consecutive opponent defections.",
-        "origin": "Classic forgiving TFT variant (TF2T).",
-        "notes": "More forgiving than TFT; less likely to spiral into retaliation after a single defection.",
-    },
-    "SuspiciousTitForTat": {
-        "description": "Defects on the first move, then mirrors the opponent’s previous move.",
-        "origin": "Classic TFT variant (STFT).",
-        "notes": "A 'hostile start' version of TFT; useful for testing strategies against early aggression.",
-    },
-    "GenerousTitForTat": {
-        "description": "Like TFT, but sometimes forgives defections and cooperates anyway (stochastic).",
-        "origin": "Classic TFT variant (GTFT).",
-        "notes": "Designed to sustain cooperation under noise; introduces controlled forgiveness.",
-    },
-    "Joss": {
-        "description": "TFT with occasional random defection ('spite') even after opponent cooperation.",
-        "origin": "Classic stochastic variant of TFT (Joss).",
-        "notes": "Injects unpredictability; can exploit overly trusting opponents but may reduce cooperation stability.",
-    },
-    "Prober": {
-        "description": "Probes early (D, C, C), then exploits if the opponent never retaliates; otherwise switches to TFT.",
-        "origin": "Classic 'tester' strategy (Prober).",
-        "notes": "Aims to detect unconditional cooperators; otherwise behaves similarly to TFT.",
-    },
-    "RandomPrime": {
-        "description": "Defects by default; on prime-numbered turns it plays randomly.",
-        "origin": "Project-defined novelty strategy (number-based turn schedule).",
-        "notes": "A mostly-defect strategy with periodic randomness tied to primes.",
-    },
-    "Fibonacci": {
-        "description": "Starts with a random base choice; plays it on Fibonacci-numbered turns, otherwise plays the opposite.",
-        "origin": "Project-defined novelty strategy (Fibonacci turn schedule).",
-        "notes": "Creates structured alternation driven by the Fibonacci sequence.",
-    },
-    "DefectiveFriedman": {
-        "description": "Defects on turns whose round number is a Friedman number; otherwise cooperates.",
-        "origin": "Project-defined novelty strategy inspired by Friedman numbers.",
-        "notes": "Rare, irregular defections determined by a curated Friedman set.",
-    },
-    "CooperativeProth": {
-        "description": "Cooperates on Proth-numbered turns; otherwise defects.",
-        "origin": "Project-defined novelty strategy inspired by Proth numbers.",
-        "notes": "Structured cooperation tied to a number-theory predicate.",
-    },
-    "LongTermRelationship": {
-        "description": "Cooperates when overall cooperation is high, defects when it’s low, and randomizes in the middle.",
-        "origin": "Project-defined relationship-health heuristic.",
-        "notes": "Uses overall cooperation rate as a proxy for 'trust' and adapts accordingly.",
-    },
-    "Parrot": {
-        "description": "Starts random, then copies the opponent for 5 turns, then goes random for 1 turn, repeating.",
-        "origin": "Project-defined periodic mimic strategy.",
-        "notes": "Mostly reactive (copying) with occasional 'reset' randomness.",
-    },
-    "OneStepBehind": {
-        "description": "Starts random, then always plays the opposite of the opponent’s previous move.",
-        "origin": "Project-defined anti-mirroring strategy.",
-        "notes": "Tries to 'beat' what the opponent did last round; can destabilize cooperation loops.",
-    },
-    "FriendlySquare": {
-        "description": "Cooperates on perfect-square turns (1, 4, 9, 16, …); otherwise plays randomly.",
-        "origin": "Project-defined novelty strategy (square-number schedule).",
-        "notes": "Mostly random with occasional deterministic cooperation markers.",
-    },
-    "LosingMyMind": {
-        "description": "Starts fully cooperative and becomes increasingly random each turn.",
-        "origin": "Project-defined gradual-noise strategy.",
-        "notes": "Models 'deteriorating consistency' over time without relying on match-length knowledge.",
-    },
-    "KeepingPeace": {
-        "description": "Starts cooperative and tries to keep the match as close to a tie as possible in points.",
-        "origin": "Project-defined 'tie-seeking' heuristic.",
-        "notes": "Tracks its own and the opponent’s points and adjusts to reduce score imbalance.",
-    },
-    "BadJudgeOfCharacter": {
-        "description": "Starts defecting; after 3 rounds it either defects forever or randomizes based on early opponent behavior.",
-        "origin": "Project-defined early-judgment strategy.",
-        "notes": "If the opponent defects more than cooperates in the first 3 rounds, it commits to defecting forever.",
-    },
-    "DefectiveDeputy": {
-        "description": "Defect-leaning strategy that becomes more likely to defect each turn.",
-        "origin": "Project-defined ramping defector.",
-        "notes": "A gradually-hardening policy that trends toward always defecting.",
-    },
-    "BadDivorce": {
-        "description": "Defects almost every turn, with one surprise cooperation on a random round.",
-        "origin": "Project-defined endgame-flavored strategy.",
-        "notes": "Defects N−1 times and cooperates once (never on the first move).",
-    },
-    "RandomStranger": {
-        "description": "Mostly random, but defects at the end to try to 'get one over' on the opponent.",
-        "origin": "Project-defined endgame betrayal strategy.",
-        "notes": "Random for most of the match; defects on the final turn when the horizon is known.",
-    },
-    "PastTrauma": {
-        "description": "Cooperates until the opponent defects 3 total times, then defects forever.",
-        "origin": "Project-defined threshold grudge strategy.",
-        "notes": "The three defections do not need to be consecutive.",
-    },
-    "MarkedMan": {
-        "description": "Defects about 90% of the time, cooperates about 10% (paranoia breaks occasionally).",
-        "origin": "Project-defined stochastic paranoia strategy.",
-        "notes": "A fixed-probability mixture policy (mostly defect).",
-    },
-    "Lottery": {
-        "description": "Defects throughout, then plays randomly on the final turn (if the horizon is known).",
-        "origin": "Project-defined endgame gamble strategy.",
-        "notes": "If match length is unknown, it behaves as an always-defect policy.",
-    },
-    "Shootout": {
-        "description": "Cooperates on the first move, then defects every other turn.",
-        "origin": "Project-defined alternating duel strategy.",
-        "notes": "Creates a predictable C/D rhythm after the opening cooperate.",
-    },
-    "ParkBus": {
-        "description": "Defects until it gets ahead on points, then cooperates forever.",
-        "origin": "Project-defined 'lock-in lead' strategy.",
-        "notes": "Attempts to secure an early advantage and then play defensively (cooperate) to preserve it.",
-    },
-    "Illuminati": {
-        "description": "Classified (black box).",
-        "origin": "Project-defined hidden strategy.",
-        "notes": "This strategy’s logic is intentionally not disclosed in the UI.",
-    },
-}
+_experiment_views_module = import_module(f"{__package__}.experiment_views" if __package__ else "experiment_views")
+_robustness_result_view = _experiment_views_module.robustness_result_view
+_robustness_seed_view = _experiment_views_module.robustness_seed_view
+_evolution_result_view = _experiment_views_module.evolution_result_view
+
+_insights_module = import_module(f"{__package__}.insights" if __package__ else "insights")
+_robustness_insights = _insights_module.robustness_insights
+_evolution_insights = _insights_module.evolution_insights
+
+_rankings_module = import_module(f"{__package__}.rankings" if __package__ else "rankings")
+ROBUSTNESS_METRICS = _rankings_module.ROBUSTNESS_METRICS
+_robustness_ranking_view = _rankings_module.robustness_ranking_view
+_evolution_generation_ranking_view = _rankings_module.evolution_generation_ranking_view
+_tournament_ranking_statement = _rankings_module.tournament_ranking_statement
+
+_match_arena_module = import_module(f"{__package__}.match_arena" if __package__ else "match_arena")
+_build_arena_frames = _match_arena_module.build_arena_frames
+_select_arena_frame = _match_arena_module.select_arena_frame
+
+_version_module = import_module(f"{__package__}.version" if __package__ else "version")
+APP_VERSION = _version_module.APP_VERSION
+GAME_VERSION = _version_module.GAME_VERSION
+ARTIFACT_SCHEMA_VERSIONS = _version_module.ARTIFACT_SCHEMA_VERSIONS
+
+
+try:
+    from .strategy_catalog import STRATEGY_PROFILES, strategy_scorecard
+except ImportError:
+    from strategy_catalog import STRATEGY_PROFILES, strategy_scorecard  # type: ignore
+
+try:
+    from .evolution import (
+        EvolutionConfig,
+        build_evolution_result,
+        evolve_moran_population,
+        evolve_population,
+        matchup_statistics,
+        normalize_evolution_config,
+        validate_evolution_result,
+    )
+except ImportError:
+    from evolution import (  # type: ignore
+        EvolutionConfig,
+        build_evolution_result,
+        evolve_moran_population,
+        evolve_population,
+        matchup_statistics,
+        normalize_evolution_config,
+        validate_evolution_result,
+    )
 
 
 # ----------------------------
@@ -264,195 +144,6 @@ def get_results(rounds_per_match: int, repetitions: int, seed: int, horizon_know
     )
 
 
-def perspective_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert ordered (strategy_1/strategy_2) rows into per-player perspective rows:
-    columns: repetition, round, strategy, opponent, move, opp_move, points, opp_points
-    """
-
-    a = df.rename(
-        columns={
-            "strategy_1": "strategy",
-            "strategy_2": "opponent",
-            "move_1": "move",
-            "move_2": "opp_move",
-            "points_1": "points",
-            "points_2": "opp_points",
-        }
-    )[
-        ["repetition", "round", "strategy", "opponent", "move", "opp_move", "points", "opp_points"]
-    ]
-
-    b = df.rename(
-        columns={
-            "strategy_2": "strategy",
-            "strategy_1": "opponent",
-            "move_2": "move",
-            "move_1": "opp_move",
-            "points_2": "points",
-            "points_1": "opp_points",
-        }
-    )[
-        ["repetition", "round", "strategy", "opponent", "move", "opp_move", "points", "opp_points"]
-    ]
-
-    out = pd.concat([a, b], ignore_index=True)
-    out["strategy"] = out["strategy"].astype("string")
-    out["opponent"] = out["opponent"].astype("string")
-    out["move"] = out["move"].astype("string")
-    out["opp_move"] = out["opp_move"].astype("string")
-    return out
-
-
-def match_level(persp: pd.DataFrame) -> pd.DataFrame:
-    m = (
-        persp.groupby(["repetition", "strategy", "opponent"], as_index=False)
-        .agg(points=("points", "sum"), opp_points=("opp_points", "sum"), rounds=("points", "size"))
-    )
-    m["outcome"] = "tie"
-    m.loc[m["points"] > m["opp_points"], "outcome"] = "win"
-    m.loc[m["points"] < m["opp_points"], "outcome"] = "loss"
-    return m
-
-
-# ----------------------------
-# Strategy classification (tags)
-# ----------------------------
-
-
-def strategy_scorecard(name: str) -> dict[str, object]:
-    """
-    Static-ish strategy classification for UI badges/scorecards.
-
-    This is intentionally simple (human-readable, not 'perfect' taxonomy).
-    """
-
-    nm = str(name or "")
-    nm = {
-        "ThePushover": "Pushover",
-        "TheThief": "Thief",
-        "ParrotPicker": "Parrot",
-        "KeepingThePeace": "KeepingPeace",
-    }.get(nm, nm)
-
-    deterministic = nm in {
-        "MrNiceGuy",
-        "BadCop",
-        "TitForTat",
-        "WinStayLoseShift",
-        "TitForTwoTats",
-        "SuspiciousTitForTat",
-        "CalculatedDefector",
-        "HoldingAGrudge",
-        "ForgiveButDontForget",
-        "BadAlternator",
-        "RitualDefection",
-        "TripleThreat",
-        "Pushover",
-        "Thief",
-        "Pattern",
-        "OneStepBehind",
-        "KeepingPeace",
-        "ParkBus",
-        "Shootout",
-        "Illuminati",
-    }
-
-    stochastic = nm in {
-        "ImSoRandom",
-        "NeverSwitchUp",
-        "GenerousTitForTat",
-        "Joss",
-        "Prober",
-        "RandomPrime",
-        "Fibonacci",
-        "LongTermRelationship",
-        "Parrot",
-        "FriendlySquare",
-        "LosingMyMind",
-        "BadJudgeOfCharacter",
-        "DefectiveDeputy",
-        "BadDivorce",
-        "RandomStranger",
-        "MarkedMan",
-        "Lottery",
-    }
-
-    # Rough "memory depth": 0, 1, or "many"
-    if nm in {"MrNiceGuy", "BadCop", "BadAlternator", "RitualDefection", "TripleThreat", "Pattern", "FriendlySquare", "Shootout"}:
-        memory: object = 0
-    elif nm in {"TitForTat", "SuspiciousTitForTat", "WinStayLoseShift", "Joss", "OneStepBehind", "Parrot"}:
-        memory = 1
-    elif nm in {
-        "HoldingAGrudge",
-        "CalculatedDefector",
-        "ForgiveButDontForget",
-        "TitForTwoTats",
-        "Prober",
-        "LongTermRelationship",
-        "KeepingPeace",
-        "ParkBus",
-        "Illuminati",
-        "BadJudgeOfCharacter",
-        "PastTrauma",
-    }:
-        memory = "many"
-    else:
-        memory = "unknown"
-
-    # Primary tendency (very rough)
-    primary_coop = nm in {"MrNiceGuy", "TitForTat", "WinStayLoseShift", "TitForTwoTats", "GenerousTitForTat", "Pushover", "KeepingPeace"}
-    primary_defect = nm in {"BadCop", "CalculatedDefector", "HoldingAGrudge", "Thief", "OneStepBehind", "DefectiveDeputy", "BadDivorce", "ParkBus"}
-
-    # Uses turn counter / schedule
-    time_based = nm in {
-        "BadAlternator",
-        "RitualDefection",
-        "TripleThreat",
-        "Pattern",
-        "NeverSwitchUp",
-        "RandomPrime",
-        "Fibonacci",
-        "DefectiveFriedman",
-        "CooperativeProth",
-        "Parrot",
-        "FriendlySquare",
-        "LosingMyMind",
-        "Shootout",
-        "BadDivorce",
-        "RandomStranger",
-        "Lottery",
-    }
-
-    reactive = nm in {
-        "TitForTat",
-        "SuspiciousTitForTat",
-        "TitForTwoTats",
-        "WinStayLoseShift",
-        "Joss",
-        "Prober",
-        "CalculatedDefector",
-        "HoldingAGrudge",
-        "ForgiveButDontForget",
-        "Pushover",
-        "Parrot",
-        "OneStepBehind",
-        "LongTermRelationship",
-        "KeepingPeace",
-        "ParkBus",
-        "Illuminati",
-        "PastTrauma",
-    }
-
-    return {
-        "deterministic": bool(deterministic and not stochastic),
-        "stochastic": bool(stochastic),
-        "memory": memory,
-        "primarily_cooperative": bool(primary_coop),
-        "primarily_defective": bool(primary_defect),
-        "reactive": bool(reactive),
-        "time_based": bool(time_based),
-    }
 
 
 # ----------------------------
@@ -468,10 +159,24 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
     assets_folder=str(_ASSETS_DIR),
     external_stylesheets=[dbc.themes.BOOTSTRAP],
-    external_scripts=[
-        "https://www.paypal.com/sdk/js?client-id=BAAl7kWTxi6DEkHN3OfgGG2D1JqpQdHd22tivmtDGJ574TMPPUoXoCqg0OlGQmeDM2aS4wbzBd0emGM7As&components=hosted-buttons&enable-funding=venmo&currency=USD"
+    meta_tags=[
+        {"name": "viewport", "content": "width=device-width, initial-scale=1"},
+        {
+            "name": "description",
+            "content": "Explore the Iterated Prisoner's Dilemma through live tournaments, custom strategies, robustness analysis, and population evolution.",
+        },
+        {"name": "theme-color", "content": "#ffffff"},
+        {"property": "og:title", "content": "Prisoner's Dilemma Strategy Lab"},
+        {
+            "property": "og:description",
+            "content": "Build strategies, run reproducible tournaments, and explore cooperation through interactive experiments.",
+        },
+        {"property": "og:type", "content": "website"},
+        {
+            "property": "og:image",
+            "content": "https://raw.githubusercontent.com/leifheaney5/PrisonersDilemmaSim/main/assets/logo.png",
+        },
     ],
-    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
 )
 
 app.title = "Prisoner's Dilemma Simulation"
@@ -498,15 +203,84 @@ app.index_string = """<!DOCTYPE html>
 
 # Expose the underlying Flask server for Render/Gunicorn:
 server = app.server
+server.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+_heavy_request_limiter = SlidingWindowLimiter(HEAVY_REQUESTS_PER_MINUTE, 60)
 
 _log = logging.getLogger("pd")
 if not _log.handlers:
     logging.basicConfig(level=logging.INFO)
 
 
+@server.get("/health")
+def health_check():
+    return jsonify({"status": "ok", "app_version": APP_VERSION, "environment": APP_ENV})
+
+
+@server.get("/health/live")
+def liveness_check():
+    """Confirm that the web process can answer requests."""
+    return jsonify({"status": "ok", "service": "web"})
+
+
+@server.get("/health/ready")
+def readiness_check():
+    """Confirm that required local application resources are usable."""
+    checks = {
+        "strategy_catalog": len(list_strategy_names()) == 60,
+        "assets": _ASSETS_DIR.is_dir() and (_ASSETS_DIR / "styles.css").is_file(),
+        "artifact_schemas": bool(ARTIFACT_SCHEMA_VERSIONS),
+    }
+    ready = all(checks.values())
+    return jsonify({"status": "ready" if ready else "not_ready", "checks": checks}), (200 if ready else 503)
+
+
+@server.get("/version")
+def version_info():
+    return jsonify(
+        {
+            "app_version": APP_VERSION,
+            "game_version": GAME_VERSION,
+            "artifact_schema_versions": ARTIFACT_SCHEMA_VERSIONS,
+            **public_runtime_metadata(),
+        }
+    )
+
+
 @server.before_request
 def _pd_start_timer():
     g._pd_start_time = time.perf_counter()
+    supplied_request_id = str(request.headers.get("X-Request-ID", ""))
+    g._pd_request_id = supplied_request_id[:80] if supplied_request_id.isascii() and supplied_request_id else uuid.uuid4().hex
+    payload = request.get_json(silent=True) if request.method == "POST" else None
+    if is_heavy_dash_submission(request.path, request.method, payload):
+        client = request.remote_addr or "unknown"
+        decision = _heavy_request_limiter.check(client)
+        if not decision.allowed:
+            response = jsonify(
+                {
+                    "error": "rate_limit_exceeded",
+                    "message": "Too many heavy experiment requests. Wait before trying again.",
+                    "request_id": g._pd_request_id,
+                }
+            )
+            response.status_code = 429
+            response.headers["Retry-After"] = str(decision.retry_after)
+            return response
+    return None
+
+
+@server.errorhandler(413)
+def request_too_large(_error):
+    return (
+        jsonify(
+            {
+                "error": "request_too_large",
+                "message": f"Request body exceeds the {MAX_REQUEST_BYTES}-byte limit.",
+                "request_id": getattr(g, "_pd_request_id", "unknown"),
+            }
+        ),
+        413,
+    )
 
 
 @server.after_request
@@ -517,14 +291,48 @@ def _pd_log_slow_requests(resp):
     ms = (time.perf_counter() - float(start)) * 1000.0
     # Useful for quick triage in Render without adding a full profiler.
     resp.headers["X-Response-Time-ms"] = f"{ms:.1f}"
+    resp.headers["X-Request-ID"] = str(getattr(g, "_pd_request_id", "unknown"))
     try:
         clen = resp.calculate_content_length()
     except Exception:
         clen = None
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(self)")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.paypal.com https://www.paypalobjects.com; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob: https://www.paypalobjects.com https://*.paypal.com https://raw.githubusercontent.com; "
+        "connect-src 'self' https://*.paypal.com; "
+        "frame-src https://*.paypal.com; "
+        "font-src 'self' data: https://cdn.jsdelivr.net; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+    )
+    if request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https":
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if request.path.startswith("/_dash-update-component") and ms >= 800:
-        _log.info("SLOW dash update: %s %s ms=%.1f bytes=%s", request.method, request.path, ms, clen)
+        _log.info(
+            "SLOW dash update request_id=%s method=%s path=%s status=%s ms=%.1f bytes=%s",
+            getattr(g, "_pd_request_id", "unknown"),
+            request.method,
+            request.path,
+            resp.status_code,
+            ms,
+            clen,
+        )
     elif ms >= 2000:
-        _log.info("SLOW request: %s %s ms=%.1f bytes=%s", request.method, request.path, ms, clen)
+        _log.info(
+            "SLOW request request_id=%s method=%s path=%s status=%s ms=%.1f bytes=%s",
+            getattr(g, "_pd_request_id", "unknown"),
+            request.method,
+            request.path,
+            resp.status_code,
+            ms,
+            clen,
+        )
     return resp
 
 
@@ -549,6 +357,7 @@ def navbar_links() -> list[dbc.NavLink]:
 
     return [
         link("Overview", "/"),
+        link("Learn", "/learn"),
         link("Profiles", "/profiles"),
         link("Experiment", "/experiment"),
     ]
@@ -557,6 +366,67 @@ def navbar_links() -> list[dbc.NavLink]:
 pio.templates.default = "plotly_white"
 
 GRAPH_CONFIG = {"displayModeBar": False, "responsive": True}
+def _custom_preview_rows(config: dict, opponent_moves: list[str], seed: int = 0) -> list[dict]:
+    """Evaluate an unsaved custom policy against a deterministic scripted opponent."""
+    name = "__preview__"
+    state = _init_strategy_state(name, config)
+    history: list[str] = []
+    rows = []
+    rng_state = seed & 0xFFFFFFFF
+    for round_number, opponent_move in enumerate(opponent_moves, start=1):
+        turn = int(state.get("turn", 0)) + 1
+        move, next_rng_state, trace = explain_custom_strategy_decision(config, history, turn, rng_state)
+        engine_move, state, rng_state = play_strategy(name, history, state, rng_state)
+        if engine_move != move or rng_state != next_rng_state:
+            raise RuntimeError("Custom preview trace diverged from the strategy engine")
+        player_points, opponent_points = payoff(move, opponent_move)
+        rows.append(
+            {
+                "round": round_number,
+                "custom_move": move,
+                "opponent_move": opponent_move,
+                "custom_points": player_points,
+                "opponent_points": opponent_points,
+                "base_rule": trace["base_rule"],
+                "safety_rule": trace["safety_rule"],
+                "threshold_rule": trace["threshold_rule"],
+                "endgame_rule": trace["endgame_rule"],
+                "noise_flip": "Yes" if trace["noise_flip"] else "No",
+            }
+        )
+        history.append(opponent_move)
+    return rows
+
+
+def _game_format_notice(include_self_play: bool = False, execution_error_rate: float = 0.0) -> tuple[str, str]:
+    """Describe whether controls preserve the app's classic tournament format."""
+    variations = []
+    if include_self_play:
+        variations.append("self-play adds same-strategy pairings")
+    if float(execution_error_rate or 0.0) > 0:
+        variations.append("execution errors may flip intended moves")
+    if not variations:
+        return "Classic IPD format: unique strategy pairings, deterministic execution of intended moves.", "success"
+    return "Experimental variant: " + "; ".join(variations) + ". Payoffs and legal actions remain unchanged.", "warning"
+
+
+def _payoff_lesson_result(player_move: str, opponent_move: str) -> dict[str, object]:
+    """Return the score and plain-language explanation for one legal round."""
+    player_points, opponent_points = payoff(player_move, opponent_move)
+    labels = {
+        ("cooperate", "cooperate"): ("Mutual cooperation", "Both players accept the reward for cooperating."),
+        ("cooperate", "defect"): ("You were exploited", "You cooperated while the opponent took the larger defection payoff."),
+        ("defect", "cooperate"): ("You exploited the opponent", "You defected while the opponent cooperated."),
+        ("defect", "defect"): ("Mutual defection", "Both players avoided the sucker payoff, but both earned less than under mutual cooperation."),
+    }
+    title, explanation = labels[(player_move, opponent_move)]
+    return {
+        "title": title,
+        "player_points": player_points,
+        "opponent_points": opponent_points,
+        "combined_points": player_points + opponent_points,
+        "explanation": explanation,
+    }
 
 app.layout = html.Div(
     id="app-shell",
@@ -588,6 +458,7 @@ app.layout = html.Div(
                         dbc.Nav(
                             [
                                 dbc.NavItem(dbc.NavLink("Overview", href="/", active="exact", external_link=False)),
+                                dbc.NavItem(dbc.NavLink("Learn", href="/learn", active="exact", external_link=False)),
                                 dbc.NavItem(dbc.NavLink("Profiles", href="/profiles", active="exact", external_link=False)),
                                 dbc.NavItem(dbc.NavLink("Experiment", href="/experiment", active="exact", external_link=False)),
                                 dbc.NavItem(
@@ -633,6 +504,27 @@ app.layout = html.Div(
                 html.Br(),
             ],
             fluid=True,
+        ),
+        html.Footer(
+            [
+                html.Span("Prisoner's Dilemma Strategy Lab"),
+                html.Span(" · "),
+                html.A(f"Version {APP_VERSION}", href="/version", target="_blank"),
+                html.Span(" · "),
+                html.A(
+                    "Privacy",
+                    href="https://github.com/leifheaney5/PrisonersDilemmaSim/blob/main/PRIVACY.md",
+                    target="_blank",
+                ),
+                html.Span(" · "),
+                html.A(
+                    "Security",
+                    href="https://github.com/leifheaney5/PrisonersDilemmaSim/blob/main/SECURITY.md",
+                    target="_blank",
+                ),
+            ],
+            id="app-footer",
+            className="app-footer",
         ),
     ],
 )
@@ -812,7 +704,7 @@ def about_page() -> html.Div:
                                                 ),
                                                 html.P(
                                                     "This is why Iterated Prisoner’s Dilemma became a classic testbed in game theory and evolutionary thinking: "
-                                                    "it’s a simple rule set that still produces rich, surprising behavior.",
+                                                    "its small set of rules can produce many different patterns of behavior.",
                                                     className="muted mb-0",
                                                 ),
                                             ]
@@ -1016,6 +908,183 @@ def about_page() -> html.Div:
     )
 
 
+def learn_page() -> html.Div:
+    move_options = [
+        {"label": "Cooperate", "value": "cooperate"},
+        {"label": "Defect", "value": "defect"},
+    ]
+    return html.Div(
+        [
+            html.Section(
+                [
+                    html.Div("LEARN", className="learn-kicker"),
+                    html.H1("Why cooperation is difficult", className="learn-title"),
+                    html.P(
+                        "The Prisoner’s Dilemma compares individual incentives with the outcome produced when both players follow them.",
+                        className="learn-intro",
+                    ),
+                    html.Div(
+                        [
+                            html.A("The one-round game", href="#one-round", className="learn-anchor"),
+                            html.A("Repeated play", href="#repeated-play", className="learn-anchor"),
+                            html.A("Mistakes and forgiveness", href="#mistakes", className="learn-anchor"),
+                            html.A("Interpretation", href="#interpretation", className="learn-anchor"),
+                        ],
+                        className="learn-nav",
+                    ),
+                ],
+                className="learn-hero",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            html.Section(
+                                [
+                                    html.Div("1", className="lesson-number"),
+                                    html.H2("The one-round game", id="one-round"),
+                                    html.P(
+                                        "Each player chooses without seeing the other player’s choice. The two choices determine both scores.",
+                                    ),
+                                    dbc.Row(
+                                        [
+                                            dbc.Col(
+                                                [dbc.Label("Your move"), dcc.Dropdown(id="learn-player-move", options=move_options, value="cooperate", clearable=False)],
+                                                md=6,
+                                            ),
+                                            dbc.Col(
+                                                [dbc.Label("Opponent move"), dcc.Dropdown(id="learn-opponent-move", options=move_options, value="cooperate", clearable=False)],
+                                                md=6,
+                                            ),
+                                        ],
+                                        className="g-3",
+                                    ),
+                                    html.Div(id="learn-payoff-result", className="learn-result"),
+                                    html.H3("Why defection dominates", className="mt-4"),
+                                    html.Ul(
+                                        [
+                                            html.Li("Against cooperation, defection scores 5 instead of 3."),
+                                            html.Li("Against defection, defection scores 1 instead of 0."),
+                                            html.Li("Defection gives the larger immediate payoff in either case."),
+                                        ]
+                                    ),
+                                    dbc.Alert(
+                                        "If both players defect, each receives 1 point. Mutual cooperation would give each player 3 points. The individually preferred action produces the lower combined score when both players choose it.",
+                                        color="primary",
+                                        className="mt-3",
+                                    ),
+                                ],
+                                className="lesson-card",
+                            ),
+                            html.Section(
+                                [
+                                    html.Div("2", className="lesson-number"),
+                                    html.H2("What repeated play changes", id="repeated-play"),
+                                    html.P(
+                                        "A defection can earn an immediate advantage, but the opponent can respond in later rounds. A strategy must consider both the current payoff and the effect of its choice on future play."
+                                    ),
+                                    dbc.Row(
+                                        [
+                                            dbc.Col([html.Strong("Reciprocity"), html.P("Respond to cooperation with cooperation and to defection with defection.")], md=4),
+                                            dbc.Col([html.Strong("Punishment"), html.P("Make exploitation costly in later rounds.")], md=4),
+                                            dbc.Col([html.Strong("Forgiveness"), html.P("Return to cooperation after a conflict instead of retaliating forever.")], md=4),
+                                        ],
+                                        className="concept-grid g-3",
+                                    ),
+                                    html.P(
+                                        "Knowing the final round can also matter. Some strategies change their behavior when no future response is possible. The Strategy Lab labels this setting as match length visibility."
+                                    ),
+                                    dbc.Button("Open the Strategy Lab", href="/experiment", color="primary", outline=True),
+                                ],
+                                className="lesson-card",
+                            ),
+                            html.Section(
+                                [
+                                    html.Div("3", className="lesson-number"),
+                                    html.H2("Mistakes and forgiveness", id="mistakes"),
+                                    html.P(
+                                        "An intended cooperation can be executed as a defection when errors are enabled. The opponent sees the executed move and may retaliate."
+                                    ),
+                                    html.Ol(
+                                        [
+                                            html.Li("Player A intends to cooperate, but an error changes the move to defection."),
+                                            html.Li("Player B responds to the observed defection."),
+                                            html.Li("Player A may treat that response as a new defection."),
+                                            html.Li("Without a recovery rule, retaliation can continue."),
+                                        ]
+                                    ),
+                                    html.P(
+                                        "The app stores intended and executed moves separately. This makes accidental defections visible in match histories and charts."
+                                    ),
+                                    dbc.Button("Run an experiment with errors", href="/experiment", color="primary", outline=True),
+                                ],
+                                className="lesson-card",
+                            ),
+                            html.Section(
+                                [
+                                    html.Div("4", className="lesson-number"),
+                                    html.H2("How to interpret a result", id="interpretation"),
+                                    html.P("A high score answers a narrow question: how well did this strategy score under these settings and opponents?"),
+                                    dbc.Table(
+                                        [
+                                            html.Thead(html.Tr([html.Th("Measure"), html.Th("What it describes"), html.Th("What it does not establish")])),
+                                            html.Tbody(
+                                                [
+                                                    html.Tr([html.Td("Points per round"), html.Td("Payoff efficiency"), html.Td("Fairness or moral value")]),
+                                                    html.Tr([html.Td("Win rate"), html.Td("How often a strategy outscored its opponent"), html.Td("Combined benefit")]),
+                                                    html.Tr([html.Td("Cooperation rate"), html.Td("How often the strategy cooperated"), html.Td("Whether cooperation was effective")]),
+                                                    html.Tr([html.Td("Score margin"), html.Td("Competitive advantage"), html.Td("Stability across seeds")]),
+                                                ]
+                                            ),
+                                        ],
+                                        bordered=True,
+                                        responsive=True,
+                                        size="sm",
+                                    ),
+                                    dbc.Alert(
+                                        "The simulator compares defined decision rules under a defined payoff table. A tournament winner is not automatically the fairest or most useful rule outside the simulation.",
+                                        color="warning",
+                                    ),
+                                ],
+                                className="lesson-card",
+                            ),
+                        ],
+                        lg=9,
+                    ),
+                    dbc.Col(
+                        html.Aside(
+                            [
+                                html.H3("Terms"),
+                                html.Dl(
+                                    [
+                                        html.Dt("Action"), html.Dd("One choice to cooperate or defect."),
+                                        html.Dt("Strategy"), html.Dd("A rule for choosing actions over time."),
+                                        html.Dt("Dominant action"), html.Dd("An action with a better immediate payoff for every opponent action."),
+                                        html.Dt("Combined payoff"), html.Dd("The sum of both players’ scores."),
+                                        html.Dt("Stochastic"), html.Dd("Uses probability when selecting at least some moves."),
+                                    ]
+                                ),
+                                html.H3("Sources", className="mt-4"),
+                                html.Ul(
+                                    [
+                                        html.Li(html.A("Stanford Encyclopedia of Philosophy", href="https://plato.stanford.edu/entries/prisoner-dilemma/", target="_blank")),
+                                        html.Li(html.A("Axelrod, The Evolution of Cooperation", href="https://doi.org/10.1126/science.7466396", target="_blank")),
+                                        html.Li(html.A("Nowak, Five Rules for the Evolution of Cooperation", href="https://doi.org/10.1126/science.1133755", target="_blank")),
+                                    ]
+                                ),
+                            ],
+                            className="learn-sidebar",
+                        ),
+                        lg=3,
+                    ),
+                ],
+                className="g-4 mt-1",
+            ),
+        ],
+        className="learn-page",
+    )
+
+
 def donate_page() -> html.Div:
     return html.Div(
         [
@@ -1033,12 +1102,17 @@ def donate_page() -> html.Div:
                                 html.Div(
                                     id="paypal-container-YCXC33LAEKQ78",
                                     style={"minHeight": "60px"},
+                                    **{"data-paypal-client-id": PAYPAL_CLIENT_ID},
                                 )
                             ]
                         ),
                         html.Hr(),
                         html.P(
-                            "Thank you — your support helps me keep improving the simulator and adding new features.",
+                            "The PayPal payment script loads only on this page. PayPal processes payment information under its own privacy policy.",
+                            className="muted small",
+                        ),
+                        html.P(
+                            "Thank you. Your support helps cover maintenance and future development.",
                             className="muted",
                         ),
                     ]
@@ -1217,6 +1291,45 @@ def profiles_page() -> html.Div:
     names = list_strategy_names()
     return html.Div(
         [
+            dbc.Card(
+                dbc.CardBody(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Small("INTERACTIVE MAP", className="section-kicker"),
+                                        html.H2("Strategy landscape", className="mb-2"),
+                                        html.P(
+                                            "See all 60 strategies at once. Select a point to open its profile and compare how strongly it responds to cooperation, how stable its actions are, and how efficiently it scores.",
+                                            className="muted mb-0",
+                                        ),
+                                    ],
+                                    className="strategy-landscape-copy",
+                                ),
+                                html.Div(
+                                    [
+                                        html.Span("Color: cooperation rate"),
+                                        html.Span("Size: points per round"),
+                                        html.Span("Shape: deterministic or stochastic"),
+                                    ],
+                                    className="strategy-landscape-key",
+                                ),
+                            ],
+                            className="strategy-landscape-header",
+                        ),
+                        dcc.Graph(id="strategy-landscape", config=GRAPH_CONFIG),
+                        html.Div(
+                            [
+                                html.Span("Defensive response", className="landscape-axis-note"),
+                                html.Span("Responsive reciprocity", className="landscape-axis-note"),
+                            ],
+                            className="strategy-landscape-scale",
+                        ),
+                    ]
+                ),
+                className="strategy-landscape-card mb-4",
+            ),
             html.H3("Profile Overview"),
             html.P("Pick a strategy to see what it does and how it performs in the current simulation settings."),
             dcc.Download(id="profile-download"),
@@ -1298,6 +1411,89 @@ def profiles_page() -> html.Div:
                 },
             ),
             html.Hr(),
+            html.H3("Matchup matrix"),
+            html.P("See where each strategy earns its score. Rows are strategies and columns are opponents.", className="muted"),
+            dbc.Row(
+                dbc.Col(
+                    [
+                        dbc.Label("Matrix metric"),
+                        dcc.Dropdown(
+                            id="matchup-matrix-metric",
+                            options=[
+                                {"label": "Points per round", "value": "points_per_round"},
+                                {"label": "Cooperation rate", "value": "cooperation_rate"},
+                                {"label": "Score margin", "value": "score_margin"},
+                                {"label": "Win rate", "value": "win_rate"},
+                                {"label": "Combined payoff", "value": "combined_payoff"},
+                                {"label": "Payoff inequality", "value": "payoff_inequality"},
+                                {"label": "Mutual cooperation rate", "value": "mutual_cooperation_rate"},
+                                {"label": "Mutual defection rate", "value": "mutual_defection_rate"},
+                                {"label": "Exploitation rate", "value": "exploitation_rate"},
+                            ],
+                            value="points_per_round",
+                            clearable=False,
+                        ),
+                    ],
+                    md=4,
+                ),
+                className="mb-2",
+            ),
+            dbc.Alert(
+                "These metrics analyze the same classic payoff matrix. They do not change the game rules.",
+                color="info",
+                className="py-2",
+            ),
+            dcc.Graph(id="matchup-matrix", config=GRAPH_CONFIG),
+            html.Div(
+                [
+                    html.H4("Matchup replay"),
+                    html.P("Select a matrix cell to inspect one repetition round by round.", className="muted"),
+                    dbc.Row(
+                        dbc.Col(
+                            [
+                                dbc.Label("Repetition"),
+                                dcc.Dropdown(
+                                    id="matchup-replay-repetition",
+                                    options=[{"label": str(index + 1), "value": index} for index in range(30)],
+                                    value=0,
+                                    clearable=False,
+                                ),
+                            ],
+                            md=3,
+                        ),
+                        className="mb-2",
+                    ),
+                    html.Div(id="matchup-replay-summary", className="matchup-replay-summary"),
+                    dcc.Store(id="matchup-arena-frames"),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Span("MATCH ARENA", className="section-kicker"),
+                                    html.H4("Step through the decisions"),
+                                    html.P(
+                                        "Move the round control to reveal actions, payoffs, execution errors, and the running score.",
+                                        className="muted mb-0",
+                                    ),
+                                ],
+                                className="mb-3",
+                            ),
+                            dcc.Slider(id="matchup-arena-round", min=1, max=1, step=1, value=1, marks={1: "1"}),
+                            html.Div(id="matchup-arena-frame", className="match-arena-frame mt-3"),
+                        ],
+                        className="match-arena mb-4",
+                    ),
+                    dcc.Graph(id="matchup-replay-figure", config=GRAPH_CONFIG),
+                    dash_table.DataTable(
+                        id="matchup-replay-table",
+                        page_size=12,
+                        style_table={"overflowX": "auto"},
+                        style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                    ),
+                ],
+                className="matchup-replay-panel",
+            ),
+            html.Hr(),
             html.H3("Compare two strategies"),
             html.P("Compare head-to-head results and behaviors side-by-side.", className="muted"),
             dbc.Row(
@@ -1358,10 +1554,25 @@ def experiment_page() -> html.Div:
             dbc.Card(
                 dbc.CardBody(
                     [
-                        html.H3("Run an experiment (real-time)"),
-                        html.P(
-                            "Run tournaments incrementally (live) or play a match yourself against a strategy.",
-                            className="muted",
+                        html.Div(
+                            [
+                                html.Div("STRATEGY LAB", className="experiment-eyebrow"),
+                                html.H1("Run Prisoner’s Dilemma experiments", className="experiment-title"),
+                                html.P(
+                                    "Choose a mode, set the rules, run the simulation, and review the results.",
+                                    className="experiment-subtitle",
+                                ),
+                            ],
+                            className="experiment-hero",
+                        ),
+                        html.Div(
+                            [
+                                html.Div([html.Span("1"), html.Strong("Choose"), html.Small("Select a lab mode")], className="workflow-step"),
+                                html.Div([html.Span("2"), html.Strong("Configure"), html.Small("Set players and rules")], className="workflow-step"),
+                                html.Div([html.Span("3"), html.Strong("Run"), html.Small("Observe live play")], className="workflow-step"),
+                                html.Div([html.Span("4"), html.Strong("Understand"), html.Small("Review the results")], className="workflow-step"),
+                            ],
+                            className="experiment-workflow",
                         ),
                         html.Hr(),
                         dcc.Store(id="tournament-state"),
@@ -1370,6 +1581,22 @@ def experiment_page() -> html.Div:
                         dcc.Interval(id="tournament-interval", interval=650, disabled=True),
                         dcc.Store(id="human-match-state"),
                         dcc.Store(id="custom-strategies", data=[]),
+                        dcc.Store(id="evolution-result"),
+                        dcc.Store(id="robustness-result"),
+                        dcc.Download(id="experiment-config-download"),
+                        html.Div(
+                            [
+                                dbc.Button("Export experiment", id="experiment-config-export", color="secondary", outline=True, size="sm"),
+                                dcc.Upload(
+                                    dbc.Button("Import experiment", color="secondary", outline=True, size="sm"),
+                                    id="experiment-config-upload",
+                                    accept="application/json,.json",
+                                    multiple=False,
+                                ),
+                                html.Span(id="experiment-config-status", className="muted"),
+                            ],
+                            className="btn-row mb-2",
+                        ),
                         dbc.Tabs(
                             [
                                 dbc.Tab(
@@ -1381,6 +1608,10 @@ def experiment_page() -> html.Div:
                                         "Select your strategies (2 minimum, 10 maximum).",
                                             color="info",
                                             className="mb-3",
+                                        ),
+                                        html.Div(
+                                            [html.Span("CONFIGURE", className="section-kicker"), html.H4("Build the tournament"), html.P("Select the strategies, rounds, and repetitions. Optional settings are listed separately.", className="muted mb-0")],
+                                            className="lab-section-heading",
                                         ),
                                         dbc.Modal(
                                             [
@@ -1460,8 +1691,15 @@ def experiment_page() -> html.Div:
                                             ],
                                             className="g-2",
                                         ),
+                                        dbc.Alert(
+                                            id="tournament-format-notice",
+                                            children=_game_format_notice()[0],
+                                            color="success",
+                                            className="mt-3 mb-0 py-2",
+                                        ),
                                         html.Br(),
-                                        dbc.Row(
+                                        dbc.Accordion(
+                                            [dbc.AccordionItem(dbc.Row(
                                             [
                                                 dbc.Col(
                                                     [
@@ -1492,30 +1730,90 @@ def experiment_page() -> html.Div:
                                                 ),
                                                 dbc.Col(
                                                     [
-                                                        html.Div(
-                                                            [
-                                                                dbc.Button("Start", id="tournament-start", color="success"),
-                                                                dbc.Button("Stop", id="tournament-stop", color="secondary", outline=True),
-                                                                dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
-                                                            ],
-                                                            className="btn-row",
+                                                        dbc.Switch(
+                                                            id="tournament-self-play",
+                                                            value=False,
+                                                            label="Include self-play",
+                                                        ),
+                                                        dbc.Label("Execution error probability", className="mt-2"),
+                                                        dbc.Input(
+                                                            id="tournament-error-rate",
+                                                            type="number",
+                                                            value=0.0,
+                                                            min=0.0,
+                                                            max=1.0,
+                                                            step=0.01,
                                                         ),
                                                     ],
-                                                    md=9,
-                                                    className="d-flex align-items-end",
+                                                    md=4,
                                                 ),
                                             ],
                                             className="g-2",
+                                            ), title="Advanced settings · seed, horizon, self-play, and execution errors")],
+                                            start_collapsed=True,
+                                            className="experiment-advanced",
+                                        ),
+                                        html.Div(
+                                            [
+                                                html.Div(
+                                                    [
+                                                        html.Strong("Ready to simulate?"),
+                                                        html.Small(" You can pause safely and resume from the same state.", className="muted"),
+                                                    ],
+                                                    className="run-prompt",
+                                                ),
+                                                html.Div(
+                                                    [
+                                                        dbc.Button("Start experiment", id="tournament-start", color="success"),
+                                                        dbc.Button("Pause", id="tournament-stop", color="secondary", outline=True),
+                                                        dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
+                                                    ],
+                                                    className="btn-row experiment-run-actions",
+                                                ),
+                                            ],
+                                            className="experiment-command-bar",
                                         ),
                                         html.Br(),
                                         html.Div(id="tournament-status", className="muted"),
                                         dbc.Progress(id="tournament-progress", value=0, striped=True, animated=True, className="mt-2"),
                                         html.Br(),
+                                        html.Div(
+                                            [html.Span("UNDERSTAND", className="section-kicker"), html.H4("Live analysis"), html.P("Review scores, decisions, outcomes, and rankings as matches finish.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Rank leaderboard by"),
+                                                        dcc.Dropdown(
+                                                            id="tournament-rank-metric",
+                                                            options=[
+                                                                {"label": "Points per round", "value": "points_per_round"},
+                                                                {"label": "Total points", "value": "total_points"},
+                                                                {"label": "Win rate", "value": "win_rate"},
+                                                                {"label": "Cooperation rate", "value": "cooperation_rate"},
+                                                            ],
+                                                            value="points_per_round",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                            ],
+                                            className="g-2 mb-2",
+                                        ),
                                         dbc.Row(
                                             [
                                                 dbc.Col(dcc.Graph(id="tournament-leaderboard", config=GRAPH_CONFIG), md=6),
                                                 dbc.Col(dcc.Graph(id="tournament-points-timeline", config=GRAPH_CONFIG), md=6),
                                             ]
+                                        ),
+                                        html.P(
+                                            id="tournament-ranking-statement",
+                                            className="ranking-statement",
+                                            role="status",
+                                            **{"aria-live": "polite"},
                                         ),
                                         html.Br(),
                                         dbc.Row(
@@ -1561,6 +1859,10 @@ def experiment_page() -> html.Div:
                                     tab_id="tab-human",
                                     children=[
                                         html.Br(),
+                                        html.Div(
+                                            [html.Span("HEAD-TO-HEAD", className="section-kicker"), html.H4("Challenge a strategy"), html.P("Choose your moves round by round and inspect how intention, execution, and score diverge.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
                                         dbc.Row(
                                             [
                                                 dbc.Col(
@@ -1587,10 +1889,23 @@ def experiment_page() -> html.Div:
                                                         dbc.Label("Seed"),
                                                         dbc.Input(id="human-seed", type="number", value=0, step=1),
                                                     ],
-                                                    md=3,
+                                                    md=2,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Execution error"),
+                                                        dbc.Input(id="human-error-rate", type="number", value=0.0, min=0.0, max=1.0, step=0.01),
+                                                    ],
+                                                    md=2,
                                                 ),
                                             ],
                                             className="g-2",
+                                        ),
+                                        dbc.Alert(
+                                            id="human-format-notice",
+                                            children=_game_format_notice()[0],
+                                            color="success",
+                                            className="mt-3 mb-0 py-2",
                                         ),
                                         html.Br(),
                                         dbc.Row(
@@ -1604,7 +1919,7 @@ def experiment_page() -> html.Div:
                                                                 dbc.Button("Defect", id="human-defect", color="warning", disabled=True),
                                                                 dbc.Button("Reset", id="human-reset", color="danger", outline=True),
                                                             ],
-                                                            className="btn-row",
+                                                            className="btn-row experiment-run-actions",
                                                         ),
                                                     ]
                                                 )
@@ -1646,10 +1961,40 @@ def experiment_page() -> html.Div:
                                     tab_id="tab-builder",
                                     children=[
                                         html.Br(),
+                                        html.Div(
+                                            [html.Span("CREATE", className="section-kicker"), html.H4("Compose a strategy"), html.P("Use a preset or configure each rule yourself.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
                                         html.H5("Custom strategy builder"),
                                         html.P(
-                                            "Create a strategy using simple rules and test it in the Tournament tab.",
+                                            "Set the rules, preview the resulting decisions, and add the strategy to a tournament.",
                                             className="muted",
+                                        ),
+                                        dbc.Alert(
+                                            [html.Strong("Rule order: "), "base response → retaliation → reputation threshold → endgame → optional noise."],
+                                            color="info",
+                                            className="py-2",
+                                        ),
+                                        dbc.Row(
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Start from a recipe (optional)"),
+                                                    dcc.Dropdown(
+                                                        id="custom-recipe",
+                                                        options=[
+                                                            {"label": "No preset", "value": "blank"},
+                                                            {"label": "Forgiving majority", "value": "peacemaker"},
+                                                            {"label": "Three-turn retaliation", "value": "sentry"},
+                                                            {"label": "Anti-mirror with noise", "value": "chaos"},
+                                                            {"label": "Late defection", "value": "betrayal"},
+                                                        ],
+                                                        value="blank",
+                                                        clearable=False,
+                                                    ),
+                                                ],
+                                                md=8,
+                                            ),
+                                            className="mb-3",
                                         ),
                                         dbc.Row(
                                             [
@@ -1683,19 +2028,46 @@ def experiment_page() -> html.Div:
                                             [
                                                 dbc.Col(
                                                     [
-                                                        dbc.Label("Rule toggles"),
+                                                        dbc.Label("Base response"),
+                                                        dcc.Dropdown(
+                                                            id="custom-response-mode",
+                                                            options=[
+                                                                {"label": "Fixed opening move", "value": "fixed"},
+                                                                {"label": "Mirror opponent (Tit-for-Tat)", "value": "tft"},
+                                                                {"label": "Oppose opponent (Anti-Tit-for-Tat)", "value": "anti_tft"},
+                                                                {"label": "Cooperative majority", "value": "soft_majority"},
+                                                                {"label": "Strict majority", "value": "hard_majority"},
+                                                            ],
+                                                            value="fixed",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Safety rules"),
                                                         dbc.Checklist(
                                                             id="custom-toggles",
                                                             options=[
-                                                                {"label": "Tit-for-tat (mirror last opponent move)", "value": "tft"},
                                                                 {"label": "Grudge (defect forever after any opponent defect)", "value": "grudge"},
+                                                                {"label": "Enable reputation threshold", "value": "threshold"},
                                                             ],
                                                             value=[],
                                                         ),
                                                     ],
-                                                    md=12,
+                                                    md=6,
                                                 ),
                                             ]
+                                        ),
+                                        html.Br(),
+                                        dbc.Row(
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Short-memory retaliation (defect if opponent defected within N moves; 0 = disabled)"),
+                                                    dcc.Slider(id="custom-retaliation-window", min=0, max=10, step=1, value=0, tooltip={"placement": "bottom"}),
+                                                ]
+                                            )
                                         ),
                                         html.Br(),
                                         dbc.Row(
@@ -1765,6 +2137,42 @@ def experiment_page() -> html.Div:
                                             ],
                                             className="g-3",
                                         ),
+                                        html.H5("Live strategy preview"),
+                                        html.P(
+                                            "Test the current controls before saving. Green cells cooperate; red cells defect. "
+                                            "The decision trace explains which rule produced every move.",
+                                            className="muted",
+                                        ),
+                                        dbc.Row(
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Preview opponent"),
+                                                    dcc.Dropdown(
+                                                        id="custom-preview-scenario",
+                                                        options=[
+                                                            {"label": "Always cooperate", "value": "cooperate"},
+                                                            {"label": "Always defect", "value": "defect"},
+                                                            {"label": "Alternator", "value": "alternator"},
+                                                            {"label": "Single betrayal", "value": "betrayal"},
+                                                            {"label": "Defection burst", "value": "burst"},
+                                                        ],
+                                                        value="betrayal",
+                                                        clearable=False,
+                                                    ),
+                                                ],
+                                                md=5,
+                                            ),
+                                            className="mb-2",
+                                        ),
+                                        dcc.Graph(id="custom-preview-figure", config=GRAPH_CONFIG),
+                                        html.Div(id="custom-preview-summary", className="muted mb-2"),
+                                        dash_table.DataTable(
+                                            id="custom-preview-table",
+                                            page_size=10,
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={"fontFamily": "system-ui", "fontSize": 12, "padding": "6px"},
+                                        ),
+                                        html.Hr(),
                                         html.Br(),
                                         dbc.Row(
                                             [
@@ -1802,12 +2210,355 @@ def experiment_page() -> html.Div:
                                         ),
                                     ],
                                 ),
+                                dbc.Tab(
+                                    label="Robustness",
+                                    tab_id="tab-robustness",
+                                    children=[
+                                        html.Br(),
+                                        dbc.Alert(
+                                            [
+                                                html.Strong("Experimental analysis. "),
+                                                "Each seed runs an independent tournament using the selected Prisoner’s Dilemma format. The sweep measures result stability; it does not change strategy rules.",
+                                            ],
+                                            color="warning",
+                                        ),
+                                        html.Div(
+                                            [
+                                                html.Span("ROBUSTNESS", className="section-kicker"),
+                                                html.H4("Test results across seeds"),
+                                                html.P("Compare typical performance with volatility instead of relying on one random seed.", className="muted mb-0"),
+                                            ],
+                                            className="lab-section-heading",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Strategies"),
+                                                        dcc.Dropdown(
+                                                            id="robustness-strategies",
+                                                            options=[{"label": name, "value": name} for name in names],
+                                                            value=["TitForTat", "GenerousTitForTat", "BadCop", "ImSoRandom"],
+                                                            multi=True,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col([dbc.Label("Starting seed"), dbc.Input(id="robustness-start-seed", type="number", value=0)], md=2),
+                                                dbc.Col([dbc.Label("Number of seeds"), dbc.Input(id="robustness-seed-count", type="number", min=1, max=100, value=10)], md=2),
+                                                dbc.Col([dbc.Label("Seed step"), dbc.Input(id="robustness-seed-step", type="number", value=1)], md=2),
+                                            ],
+                                            className="g-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col([dbc.Label("Rounds per match"), dbc.Input(id="robustness-rounds", type="number", min=1, max=1000, value=50)], md=2),
+                                                dbc.Col([dbc.Label("Repetitions per seed"), dbc.Input(id="robustness-repetitions", type="number", min=1, max=100, value=3)], md=2),
+                                                dbc.Col([dbc.Label("Execution error probability"), dbc.Input(id="robustness-error-rate", type="number", min=0, max=1, step=0.01, value=0)], md=3),
+                                                dbc.Col(dbc.Switch(id="robustness-self-play", label="Include self-play", value=False), md=2),
+                                                dbc.Col(dbc.Switch(id="robustness-horizon-known", label="Match length is known", value=False), md=3),
+                                            ],
+                                            className="g-3 mt-2 align-items-end",
+                                        ),
+                                        html.Div(
+                                            [
+                                                dbc.Button("Run seed sweep", id="robustness-run", color="primary"),
+                                                dbc.Button("Reset result", id="robustness-reset", color="danger", outline=True),
+                                                dbc.Button("Export result", id="robustness-export", color="secondary", outline=True),
+                                                dcc.Upload(
+                                                    dbc.Button("Open result", color="secondary", outline=True),
+                                                    id="robustness-import",
+                                                    accept="application/json,.json",
+                                                    multiple=False,
+                                                ),
+                                                dcc.Download(id="robustness-download"),
+                                            ],
+                                            className="btn-row mt-3",
+                                        ),
+                                        html.Div(id="robustness-status", className="mt-2"),
+                                        html.Div(id="robustness-transfer-status", className="muted mt-2"),
+                                        html.Div(id="robustness-insights", className="mt-3"),
+                                        html.Div(
+                                            [
+                                                html.Div(
+                                                    [
+                                                        html.Div(
+                                                            [
+                                                                html.Span("INTERACTIVE RANKING", className="section-kicker"),
+                                                                html.H4("Explore the result order"),
+                                                                html.P(
+                                                                    "Change the metric, then select a bar for a deterministic performance statement.",
+                                                                    className="muted mb-0",
+                                                                ),
+                                                            ]
+                                                        ),
+                                                        dcc.Dropdown(
+                                                            id="robustness-ranking-metric",
+                                                            options=[
+                                                                {"label": definition["label"], "value": metric}
+                                                                for metric, definition in ROBUSTNESS_METRICS.items()
+                                                            ],
+                                                            value="mean_payoff",
+                                                            clearable=False,
+                                                            className="ranking-metric-picker",
+                                                        ),
+                                                    ],
+                                                    className="ranking-explorer-header",
+                                                ),
+                                                dcc.Graph(id="robustness-ranking-chart", config=GRAPH_CONFIG),
+                                                html.P(
+                                                    id="robustness-ranking-statement",
+                                                    className="ranking-statement",
+                                                    role="status",
+                                                    **{"aria-live": "polite"},
+                                                ),
+                                            ],
+                                            className="ranking-explorer mt-3",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="robustness-payoff-chart", config=GRAPH_CONFIG), md=6),
+                                                dbc.Col(dcc.Graph(id="robustness-rank-chart", config=GRAPH_CONFIG), md=6),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        dash_table.DataTable(
+                                            id="robustness-summary-table",
+                                            sort_action="native",
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={"fontFamily": "system-ui", "fontSize": 12, "padding": "7px"},
+                                        ),
+                                        html.Hr(),
+                                        html.Div(
+                                            [
+                                                html.H4("Seed inspector"),
+                                                html.P("Inspect one independent tournament without rerunning the sweep.", className="muted"),
+                                                dcc.Dropdown(id="robustness-seed-inspector", clearable=False),
+                                                dbc.Row(
+                                                    [
+                                                        dbc.Col(dcc.Graph(id="robustness-seed-payoff-chart", config=GRAPH_CONFIG), md=6),
+                                                        dbc.Col(dcc.Graph(id="robustness-seed-cooperation-chart", config=GRAPH_CONFIG), md=6),
+                                                    ],
+                                                    className="g-3",
+                                                ),
+                                                dash_table.DataTable(
+                                                    id="robustness-seed-table",
+                                                    sort_action="native",
+                                                    style_table={"overflowX": "auto"},
+                                                    style_cell={"fontFamily": "system-ui", "fontSize": 12, "padding": "7px"},
+                                                ),
+                                            ],
+                                            className="evolution-inspector",
+                                        ),
+                                    ],
+                                ),
+                                dbc.Tab(
+                                    label="Evolution",
+                                    tab_id="tab-evolution",
+                                    children=[
+                                        html.Br(),
+                                        dbc.Alert(
+                                            [
+                                                html.Strong("Experimental extension. "),
+                                                "Population shares change between generations. Individual matches still use the classic Prisoner’s Dilemma actions and payoff matrix.",
+                                            ],
+                                            color="warning",
+                                        ),
+                                        html.Div(
+                                            [html.Span("EVOLUTION", className="section-kicker"), html.H4("Population experiment"), html.P("Start with equal strategy shares and track how relative payoff changes the population.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Strategies"),
+                                                        dcc.Dropdown(
+                                                            id="evolution-strategies",
+                                                            options=[{"label": name, "value": name} for name in names],
+                                                            value=["TitForTat", "Gradual", "BadCop", "MrNiceGuy"],
+                                                            multi=True,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col([dbc.Label("Generations"), dbc.Input(id="evolution-generations", type="number", min=1, max=500, value=100)], md=2),
+                                                dbc.Col([dbc.Label("Rounds per matchup"), dbc.Input(id="evolution-rounds", type="number", min=1, max=100, value=20)], md=2),
+                                                dbc.Col([dbc.Label("Seed"), dbc.Input(id="evolution-seed", type="number", value=0)], md=2),
+                                            ],
+                                            className="g-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Population preset"),
+                                                        dcc.Dropdown(
+                                                            id="evolution-preset",
+                                                            options=[
+                                                                {"label": "Equal shares", "value": "equal"},
+                                                                {"label": "First strategy at 99%, second at 1%", "value": "invasion"},
+                                                                {"label": "Random shares", "value": "random"},
+                                                            ],
+                                                            value="equal",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                                dbc.Col(
+                                                    dash_table.DataTable(
+                                                        id="evolution-population-table",
+                                                        columns=[
+                                                            {"name": "Strategy", "id": "strategy", "editable": False},
+                                                            {"name": "Starting share", "id": "share", "type": "numeric", "editable": True},
+                                                        ],
+                                                        data=[{"strategy": name, "share": 0.25} for name in ["TitForTat", "Gradual", "BadCop", "MrNiceGuy"]],
+                                                        editable=True,
+                                                        style_table={"overflowX": "auto"},
+                                                        style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                                                    ),
+                                                    md=8,
+                                                ),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Population model"),
+                                                        dcc.Dropdown(
+                                                            id="evolution-model",
+                                                            options=[
+                                                                {"label": "Deterministic replicator dynamics", "value": "replicator"},
+                                                                {"label": "Finite-population Moran process", "value": "moran"},
+                                                            ],
+                                                            value="replicator",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Finite population size"),
+                                                        dbc.Input(id="evolution-population-size", type="number", min=10, max=10000, value=100, disabled=True),
+                                                        html.Small("Used only by the Moran process", className="muted"),
+                                                    ],
+                                                    md=2,
+                                                ),
+                                                dbc.Col([dbc.Label("Match repetitions"), dbc.Input(id="evolution-repetitions", type="number", min=1, max=30, value=3)], md=2),
+                                                dbc.Col([dbc.Label("Execution error probability"), dbc.Input(id="evolution-error-rate", type="number", min=0, max=1, step=0.01, value=0)], md=4),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Match information"),
+                                                        dbc.Switch(id="evolution-horizon-known", label="Strategies know the number of rounds", value=False),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Selection strength"),
+                                                        dcc.Slider(id="evolution-selection", min=0, max=1, step=0.05, value=1, marks={0: "None", 0.5: "0.5", 1: "Full"}),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Mutation rate"),
+                                                        dcc.Slider(id="evolution-mutation", min=0, max=0.25, step=0.01, value=0, marks={0: "0%", 0.1: "10%", 0.25: "25%"}),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        html.Div(
+                                            [
+                                                dbc.Button("Run evolution", id="evolution-run", color="primary"),
+                                                dbc.Button("Reset result", id="evolution-reset", color="danger", outline=True),
+                                                dbc.Button("Export settings", id="evolution-export", color="secondary", outline=True),
+                                                dcc.Upload(
+                                                    dbc.Button("Import settings", color="secondary", outline=True),
+                                                    id="evolution-import",
+                                                    accept="application/json,.json",
+                                                    multiple=False,
+                                                ),
+                                                dcc.Download(id="evolution-config-download"),
+                                                dbc.Button("Export result", id="evolution-result-export", color="secondary", outline=True),
+                                                dcc.Upload(
+                                                    dbc.Button("Open result", color="secondary", outline=True),
+                                                    id="evolution-result-import",
+                                                    accept="application/json,.json",
+                                                    multiple=False,
+                                                ),
+                                                dcc.Download(id="evolution-result-download"),
+                                            ],
+                                            className="btn-row mt-3",
+                                        ),
+                                        html.Div(id="evolution-transfer-status", className="muted mt-2"),
+                                        html.Div(id="evolution-result-transfer-status", className="muted mt-2"),
+                                        html.Div(id="evolution-status", className="mt-2"),
+                                        html.Div(id="evolution-insights", className="mt-3"),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="evolution-population-chart", config=GRAPH_CONFIG), md=12),
+                                                dbc.Col(dcc.Graph(id="evolution-outcomes-chart", config=GRAPH_CONFIG), md=12),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        dash_table.DataTable(
+                                            id="evolution-final-table",
+                                            sort_action="native",
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                                        ),
+                                        html.Hr(),
+                                        html.Div(
+                                            [
+                                                html.H4("Generation inspector"),
+                                                html.P("Select a completed generation. Changing this control does not rerun the experiment.", className="muted"),
+                                                dcc.Slider(id="evolution-generation", min=0, max=1, step=1, value=0, marks={0: "0"}),
+                                                html.Div(id="evolution-generation-summary", className="mt-3"),
+                                                dcc.Graph(id="evolution-generation-ranking", config=GRAPH_CONFIG),
+                                                html.P(
+                                                    id="evolution-generation-ranking-statement",
+                                                    className="ranking-statement",
+                                                    role="status",
+                                                    **{"aria-live": "polite"},
+                                                ),
+                                                dash_table.DataTable(
+                                                    id="evolution-generation-table",
+                                                    sort_action="native",
+                                                    style_table={"overflowX": "auto"},
+                                                    style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                                                ),
+                                                html.H4("Event log", className="mt-4"),
+                                                html.Div(id="evolution-event-log", className="evolution-event-log"),
+                                            ],
+                                            className="evolution-inspector",
+                                        ),
+                                    ],
+                                ),
                             ],
+                            id="experiment-mode-tabs",
                             active_tab="tab-tournament",
+                            className="experiment-mode-tabs",
                         ),
                     ]
                 ),
-                className="glass-card",
+                className="glass-card experiment-shell",
             )
         ]
     )
@@ -1818,11 +2569,37 @@ def experiment_page() -> html.Div:
 # ----------------------------
 
 
+def not_found_page(pathname: str) -> html.Div:
+    return html.Div(
+        dbc.Card(
+            dbc.CardBody(
+                [
+                    html.Div("404", className="section-kicker"),
+                    html.H2("Page not found"),
+                    html.P(f"There is no page at {pathname}.", className="muted"),
+                    html.Div(
+                        [
+                            dbc.Button("Go to Overview", href="/", color="primary"),
+                            dbc.Button("Open Learn", href="/learn", color="secondary", outline=True),
+                            dbc.Button("Open Experiment", href="/experiment", color="secondary", outline=True),
+                            dbc.Button("Open Profiles", href="/profiles", color="secondary", outline=True),
+                        ],
+                        className="btn-row",
+                    ),
+                ]
+            ),
+            className="glass-card not-found-card",
+        )
+    )
+
+
 @callback(
     Output("page-content", "children"),
     Input("url", "pathname"),
 )
 def display_page(pathname: str):
+    if pathname == "/learn":
+        return learn_page()
     if pathname == "/profiles":
         return profiles_page()
     if pathname == "/experiment":
@@ -1832,13 +2609,328 @@ def display_page(pathname: str):
         return html.Div([dcc.Location(id="redirect-explore", href="/experiment")])
     if pathname == "/donate":
         return donate_page()
-    # default: about/overview
-    return about_page()
+    if pathname in {"/", "", None}:
+        return about_page()
+    return not_found_page(str(pathname))
+
+
+@callback(
+    Output("learn-payoff-result", "children"),
+    Input("learn-player-move", "value"),
+    Input("learn-opponent-move", "value"),
+)
+def update_payoff_lesson(player_move: str, opponent_move: str):
+    result = _payoff_lesson_result(player_move, opponent_move)
+    return [
+        html.Div(
+            [
+                html.Div([html.Small("You"), html.Strong(str(result["player_points"]))], className="lesson-score"),
+                html.Div([html.Small("Opponent"), html.Strong(str(result["opponent_points"]))], className="lesson-score"),
+                html.Div([html.Small("Combined"), html.Strong(str(result["combined_points"]))], className="lesson-score"),
+            ],
+            className="lesson-score-row",
+        ),
+        html.H3(str(result["title"]), className="mt-3 mb-1"),
+        html.P(str(result["explanation"]), className="mb-0"),
+    ]
 
 
 # ----------------------------
 # Profile callbacks
 # ----------------------------
+
+
+@callback(
+    Output("strategy-landscape", "figure"),
+    Input("sim-settings", "data"),
+)
+def update_strategy_landscape(sim_settings: dict):
+    settings = dict(sim_settings or {})
+    results = get_results(
+        int(settings.get("rounds_per_match", 10) or 10),
+        int(settings.get("repetitions", 10) or 10),
+        int(settings.get("seed", 0) or 0),
+        bool(settings.get("horizon_known", True)),
+    )
+    landscape = _strategy_landscape_frame(results)
+    if landscape.empty:
+        return px.scatter(title="No strategy landscape data available")
+    landscape["policy_type"] = landscape["strategy"].map(
+        lambda name: "Deterministic" if strategy_scorecard(name)["deterministic"] else "Stochastic"
+    )
+    figure = px.scatter(
+        landscape,
+        x="response_gap",
+        y="stability",
+        color="cooperation_rate",
+        size="points_per_round",
+        symbol="policy_type",
+        hover_name="strategy",
+        custom_data=["strategy"],
+        color_continuous_scale=[
+            (0, "#440154"),
+            (0.35, "#31688e"),
+            (0.7, "#35b779"),
+            (1, "#fde725"),
+        ],
+        range_color=[0, 1],
+        size_max=30,
+        labels={
+            "response_gap": "Response gap",
+            "stability": "Action stability",
+            "cooperation_rate": "Cooperation rate",
+            "points_per_round": "Points per round",
+            "policy_type": "Policy type",
+        },
+    )
+    figure.add_vline(x=0, line_width=1, line_dash="dot", line_color="rgba(100,116,139,.65)")
+    figure.add_hline(y=0.5, line_width=1, line_dash="dot", line_color="rgba(100,116,139,.65)")
+    figure.add_annotation(x=0.82, y=0.94, text="Stable reciprocators", showarrow=False)
+    figure.add_annotation(x=-0.45, y=0.94, text="Stable defenders", showarrow=False)
+    figure.add_annotation(x=0.82, y=0.08, text="Reactive switchers", showarrow=False)
+    figure.update_traces(marker={"line": {"width": 1.2, "color": "rgba(15,23,42,.6)"}})
+    figure.update_layout(
+        height=620,
+        margin=dict(l=20, r=20, t=25, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15,23,42,.035)",
+        hovermode="closest",
+        transition={"duration": 350, "easing": "cubic-in-out"},
+        xaxis={"range": [-1.05, 1.05], "tickformat": ".0%", "gridcolor": "rgba(148,163,184,.18)"},
+        yaxis={"range": [-0.03, 1.03], "tickformat": ".0%", "gridcolor": "rgba(148,163,184,.18)"},
+        legend={"orientation": "h", "y": 1.08, "x": 0},
+    )
+    return figure
+
+
+@callback(
+    Output("profile-strategy", "value"),
+    Input("strategy-landscape", "clickData"),
+    prevent_initial_call=True,
+)
+def select_landscape_strategy(click_data):
+    if not click_data or not click_data.get("points"):
+        return dash.no_update
+    point = click_data["points"][0]
+    custom_data = point.get("customdata") or []
+    strategy = str(custom_data[0]) if custom_data else str(point.get("hovertext", ""))
+    return strategy if strategy in set(list_strategy_names()) else dash.no_update
+
+
+@callback(
+    Output("matchup-matrix", "figure"),
+    Input("matchup-matrix-metric", "value"),
+    Input("sim-settings", "data"),
+)
+def update_matchup_matrix(metric: str, sim_settings: dict):
+    settings = dict(sim_settings or {})
+    results = get_results(
+        int(settings.get("rounds_per_match", 10) or 10),
+        int(settings.get("repetitions", 10) or 10),
+        int(settings.get("seed", 0) or 0),
+        bool(settings.get("horizon_known", True)),
+    )
+    matrix = _pairwise_metric_frame(results, metric)
+    labels = {
+        "points_per_round": "Points per round",
+        "cooperation_rate": "Cooperation rate",
+        "score_margin": "Score margin",
+        "win_rate": "Win rate",
+        "combined_payoff": "Combined payoff",
+        "payoff_inequality": "Payoff inequality",
+        "mutual_cooperation_rate": "Mutual cooperation rate",
+        "mutual_defection_rate": "Mutual defection rate",
+        "exploitation_rate": "Exploitation rate",
+    }
+    selected = metric if metric in labels else "points_per_round"
+    if matrix.empty:
+        return px.scatter(title="No matchup data available")
+    if selected == "score_margin":
+        bound = max(1.0, float(matrix.abs().max().max()))
+        color_scale = "RdBu_r"
+        color_range = [-bound, bound]
+    else:
+        color_scale = "Viridis"
+        if selected == "combined_payoff":
+            color_range = [0, 6]
+        elif selected in {"points_per_round", "payoff_inequality"}:
+            color_range = [0, 5]
+        else:
+            color_range = [0, 1]
+    figure = px.imshow(
+        matrix,
+        color_continuous_scale=color_scale,
+        zmin=color_range[0],
+        zmax=color_range[1],
+        aspect="auto",
+        labels={"x": "Opponent", "y": "Strategy", "color": labels[selected]},
+        title=f"Pairwise matchup matrix: {labels[selected].lower()}",
+    )
+    figure.update_layout(height=760, margin=dict(l=10, r=10, t=60, b=10))
+    return figure
+
+
+@callback(
+    Output("matchup-replay-summary", "children"),
+    Output("matchup-replay-figure", "figure"),
+    Output("matchup-replay-table", "columns"),
+    Output("matchup-replay-table", "data"),
+    Output("matchup-arena-frames", "data"),
+    Input("matchup-matrix", "clickData"),
+    Input("matchup-replay-repetition", "value"),
+    Input("sim-settings", "data"),
+)
+def update_matchup_replay(click_data, repetition: int, sim_settings: dict):
+    if not click_data or not click_data.get("points"):
+        return "Select a cell in the matrix.", go.Figure(), [], [], []
+    point = click_data["points"][0]
+    strategy = str(point.get("y", ""))
+    opponent = str(point.get("x", ""))
+    settings = dict(sim_settings or {})
+    results = get_results(
+        int(settings.get("rounds_per_match", 10) or 10),
+        int(settings.get("repetitions", 10) or 10),
+        int(settings.get("seed", 0) or 0),
+        bool(settings.get("horizon_known", True)),
+    )
+    replay = _matchup_replay_frame(results, strategy, opponent, int(repetition or 0))
+    if replay.empty:
+        return f"No data for repetition {int(repetition or 0) + 1}.", go.Figure(), [], [], []
+
+    rounds = replay["round"].tolist()
+    action_values = [
+        [0 if move == "cooperate" else 1 for move in replay["strategy_move"]],
+        [0 if move == "cooperate" else 1 for move in replay["opponent_move"]],
+    ]
+    action_text = [["C" if value == 0 else "D" for value in row] for row in action_values]
+    figure = make_subplots(rows=2, cols=1, row_heights=[0.34, 0.66], vertical_spacing=0.16)
+    figure.add_trace(
+        go.Heatmap(
+            x=rounds,
+            y=[strategy, opponent],
+            z=action_values,
+            text=action_text,
+            texttemplate="%{text}",
+            colorscale=[[0, "#2ca02c"], [0.499, "#2ca02c"], [0.5, "#d62728"], [1, "#d62728"]],
+            showscale=False,
+            hovertemplate="Round %{x}<br>%{y}: %{text}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(x=rounds, y=replay["cumulative_strategy"], name=strategy, mode="lines+markers"),
+        row=2,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(x=rounds, y=replay["cumulative_opponent"], name=opponent, mode="lines+markers"),
+        row=2,
+        col=1,
+    )
+    figure.update_layout(
+        title=f"{strategy} vs {opponent}, repetition {int(repetition or 0) + 1}",
+        height=560,
+        margin=dict(l=10, r=10, t=60, b=30),
+        hovermode="x unified",
+    )
+    figure.update_xaxes(title_text="Round", row=2, col=1)
+    figure.update_yaxes(title_text="Cumulative points", row=2, col=1)
+
+    mutual_cooperation = float((replay["outcome"] == "mutual cooperation").mean())
+    mutual_defection = float((replay["outcome"] == "mutual defection").mean())
+    exploitation = float((replay["strategy_move"] != replay["opponent_move"]).mean())
+    summary = dbc.Row(
+        [
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Combined payoff"), html.H4(f"{replay['combined_payoff'].mean():.2f}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Mutual cooperation"), html.H4(f"{mutual_cooperation:.0%}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Mutual defection"), html.H4(f"{mutual_defection:.0%}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Exploitation"), html.H4(f"{exploitation:.0%}")])), md=3),
+        ],
+        className="g-2 mb-2",
+    )
+    table = replay.copy()
+    for column in ("strategy_move", "opponent_move", "strategy_intended", "opponent_intended"):
+        table[column] = table[column].map({"cooperate": "C", "defect": "D"})
+    visible = [
+        "round",
+        "strategy_move",
+        "opponent_move",
+        "strategy_points",
+        "opponent_points",
+        "combined_payoff",
+        "outcome",
+    ]
+    table = table[visible]
+    columns = [{"name": column.replace("_", " ").title(), "id": column} for column in visible]
+    frames = _build_arena_frames(replay.to_dict("records"), strategy, opponent)
+    return summary, figure, columns, table.to_dict("records"), frames
+
+
+@callback(
+    Output("matchup-arena-round", "max"),
+    Output("matchup-arena-round", "marks"),
+    Output("matchup-arena-round", "value"),
+    Input("matchup-arena-frames", "data"),
+)
+def configure_match_arena(frames):
+    count = len(frames) if isinstance(frames, list) else 0
+    if not count:
+        return 1, {1: "1"}, 1
+    step = max(1, count // 5)
+    marks = {value: str(value) for value in range(1, count + 1, step)}
+    marks[count] = str(count)
+    return count, marks, 1
+
+
+@callback(
+    Output("matchup-arena-frame", "children"),
+    Input("matchup-arena-frames", "data"),
+    Input("matchup-arena-round", "value"),
+)
+def render_match_arena(frames, round_number):
+    frame = _select_arena_frame(frames, round_number)
+    if frame is None:
+        return html.P("Select a matchup matrix cell to open the Match Arena.", className="muted mb-0")
+
+    def player_card(prefix):
+        name = str(frame[prefix])
+        move = str(frame[f"{prefix}_move"])
+        intended = str(frame[f"{prefix}_intended"])
+        changed = bool(frame[f"{prefix}_error"])
+        return html.Div(
+            [
+                html.H5(name, className="arena-player-name"),
+                html.Div("C" if move == "cooperate" else "D", className=f"arena-move arena-move-{move}"),
+                html.Strong(move.title()),
+                html.Small(
+                    f"Intended {intended.title()} · execution flipped" if changed else f"Intended {intended.title()}",
+                    className="arena-intention",
+                ),
+                html.Div(
+                    [
+                        html.Span(f"+{int(frame[f'{prefix}_points'])} this round"),
+                        html.Strong(f"{int(frame[f'{prefix}_total'])} total"),
+                    ],
+                    className="arena-score",
+                ),
+            ],
+            className=f"arena-player {'arena-player-error' if changed else ''}",
+        )
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Span(f"Round {int(frame['round'])}", className="arena-round-label"),
+                    html.Strong(str(frame["outcome"]), className="arena-outcome"),
+                ],
+                className="arena-round-header",
+            ),
+            html.Div([player_card("strategy"), html.Div("VS", className="arena-versus"), player_card("opponent")], className="arena-players"),
+            html.P(str(frame["statement"]), className="arena-statement", role="status", **{"aria-live": "polite"}),
+        ]
+    )
 
 
 @callback(
@@ -1874,7 +2966,7 @@ def update_profile(strategy: str, sim_settings: dict):
             html.H6("Origin"),
             html.P(profile.get("origin", "Unknown / not documented.")),
             html.H6("Notes"),
-            html.P(profile.get("notes", "—")),
+            html.P(profile.get("notes", "Not available")),
         ]
     )
 
@@ -2183,7 +3275,7 @@ def export_profile(_csv, _png, _pdf, strategy: str, sim_settings: dict):
     )
 
     report.update_layout(
-        title=f"Profile export — {strategy}",
+        title=f"Profile export: {strategy}",
         height=900,
         margin=dict(l=30, r=20, t=80, b=30),
         paper_bgcolor="#ffffff",
@@ -2280,6 +3372,93 @@ def sync_sim_settings(rounds, reps, seed, horizon_known, current):
 
 
 @callback(
+    Output("experiment-config-download", "data"),
+    Output("experiment-config-status", "children"),
+    Output("tournament-strategies", "value", allow_duplicate=True),
+    Output("tournament-strategies", "options", allow_duplicate=True),
+    Output("tournament-rounds", "value"),
+    Output("tournament-reps", "value"),
+    Output("tournament-seed", "value"),
+    Output("tournament-horizon-known", "value"),
+    Output("tournament-self-play", "value"),
+    Output("tournament-error-rate", "value"),
+    Output("custom-strategies", "data", allow_duplicate=True),
+    Input("experiment-config-export", "n_clicks"),
+    Input("experiment-config-upload", "contents"),
+    State("tournament-strategies", "value"),
+    State("tournament-rounds", "value"),
+    State("tournament-reps", "value"),
+    State("tournament-seed", "value"),
+    State("tournament-horizon-known", "value"),
+    State("tournament-self-play", "value"),
+    State("tournament-error-rate", "value"),
+    State("custom-strategies", "data"),
+    prevent_initial_call=True,
+)
+def transfer_experiment_config(_export, upload_contents, strategies, rounds, reps, seed, horizon_known, include_self_play, execution_error_rate, custom_strategies):
+    no_change = (dash.no_update,) * 9
+    if dash.ctx.triggered_id == "experiment-config-export":
+        payload = {
+            "schema_version": 1,
+            "strategies": list(strategies or []),
+            "rounds_per_match": int(rounds or 10),
+            "repetitions": int(reps or 10),
+            "seed": int(seed or 0),
+            "horizon_known": bool(horizon_known),
+            "include_self_play": bool(include_self_play),
+            "execution_error_rate": float(execution_error_rate or 0.0),
+            "custom_strategies": list(custom_strategies or []),
+        }
+        return dcc.send_string(json.dumps(payload, indent=2), "prisoners-dilemma-experiment.json"), "Experiment exported.", *no_change
+
+    try:
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 100_000:
+            raise ValueError("configuration file exceeds 100 KB")
+        payload = json.loads(decoded.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("unsupported or missing schema_version")
+        imported_custom = payload.get("custom_strategies", [])
+        if not isinstance(imported_custom, list):
+            raise ValueError("custom_strategies must be a list")
+        custom_map = {
+            str(item["name"]): item["config"]
+            for item in imported_custom
+            if isinstance(item, dict) and "name" in item and "config" in item
+        }
+        imported_strategies = [str(name) for name in payload.get("strategies", [])]
+        validated = init_tournament_state(
+            strategy_names=imported_strategies,
+            rounds_per_match=int(payload.get("rounds_per_match", 10)),
+            repetitions=int(payload.get("repetitions", 10)),
+            seed=int(payload.get("seed", 0)),
+            horizon_known=bool(payload.get("horizon_known", True)),
+            include_self_play=bool(payload.get("include_self_play", False)),
+            execution_error_rate=float(payload.get("execution_error_rate", 0.0)),
+            custom_strategies=custom_map,
+        )
+        normalized_custom = [{"name": name, "config": config} for name, config in validated["custom_strategies"].items()]
+        options = [{"label": name, "value": name} for name in list_strategy_names()]
+        options.extend({"label": f"{item['name']} (custom)", "value": item["name"]} for item in normalized_custom)
+        return (
+            dash.no_update,
+            "Experiment imported. Review the settings, then press Start.",
+            validated["strategy_names"],
+            options,
+            validated["rounds_per_match"],
+            validated["repetitions"],
+            validated["seed"],
+            validated["horizon_known"],
+            validated["include_self_play"],
+            validated["execution_error_rate"],
+            normalized_custom,
+        )
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Import failed: {exc}", *no_change
+
+
+@callback(
     Output("tournament-strategies", "value"),
     Output("tournament-random-feedback", "children"),
     Input("tournament-random-10", "n_clicks"),
@@ -2304,7 +3483,7 @@ def pick_random_strategies(n_clicks, current_value, seed):
         if len(v) <= 10:
             return v, ""
         trimmed = v[-10:]
-        return trimmed, "Max 10 strategies — trimmed to the most recent 10 selections."
+        return trimmed, "The limit is 10 strategies. The most recent 10 selections were kept."
 
     # Random button
     k = min(10, len(names))
@@ -2313,6 +3492,15 @@ def pick_random_strategies(n_clicks, current_value, seed):
     rng = random.Random((base_seed + 1000003 * clicks) & 0xFFFFFFFF)
     chosen = rng.sample(names, k=k)
     return chosen, f"Selected {len(chosen)} random strategies."
+
+
+@callback(
+    Output("tournament-ranking-statement", "children"),
+    Input("tournament-state", "data"),
+    Input("tournament-rank-metric", "value"),
+)
+def render_tournament_ranking(state, metric):
+    return _tournament_ranking_statement(state, str(metric or "points_per_round"))
 
 
 @callback(
@@ -2335,15 +3523,18 @@ def pick_random_strategies(n_clicks, current_value, seed):
     Input("tournament-reset", "n_clicks"),
     Input("tournament-summary-close", "n_clicks"),
     Input("tournament-interval", "n_intervals"),
+    Input("tournament-rank-metric", "value"),
     State("tournament-strategies", "value"),
     State("tournament-rounds", "value"),
     State("tournament-reps", "value"),
     State("tournament-seed", "value"),
     State("custom-strategies", "data"),
     State("tournament-horizon-known", "value"),
+    State("tournament-self-play", "value"),
+    State("tournament-error-rate", "value"),
     State("tournament-state", "data"),
 )
-def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds, reps, seed, custom_strategies, horizon_known, state):
+def tournament_controller(_start, _stop, _reset, _close, _n, rank_metric, strategies, rounds, reps, seed, custom_strategies, horizon_known, include_self_play, execution_error_rate, state):
 
     def _summary_children(current_state: dict) -> html.Div:
         names = list(current_state.get("strategy_names", []))
@@ -2360,9 +3551,9 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             c = int(coop.get(s, 0))
             coop_rate = (c / rp) if rp else 0.0
             w = int(wins.get(s, 0))
-            l = int(losses.get(s, 0))
+            loss_count = int(losses.get(s, 0))
             t = int(ties.get(s, 0))
-            matches = w + l + t
+            matches = w + loss_count + t
             win_pct = (w / matches) if matches else 0.0
 
             total_points = int(totals.get(s, 0))
@@ -2373,7 +3564,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                     "strategy": s,
                     "total_points": total_points,
                     "wins": w,
-                    "losses": l,
+                    "losses": loss_count,
                     "ties": t,
                     "win_pct": win_pct,
                     "ppt": ppt,
@@ -2383,7 +3574,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             )
 
         df = pd.DataFrame(rows).sort_values(["total_points", "wins"], ascending=False).reset_index(drop=True)
-        winner = str(df.iloc[0]["strategy"]) if not df.empty else "—"
+        winner = str(df.iloc[0]["strategy"]) if not df.empty else "Not available"
         top3 = df.head(3)["strategy"].tolist() if len(df) >= 3 else df["strategy"].tolist()
 
         # Highlights / tidbits
@@ -2393,7 +3584,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
 
         def _row_str(rdf, label, fmt):
             if rdf.empty:
-                return html.Li([html.Strong(f"{label}: "), "—"])
+                return html.Li([html.Strong(f"{label}: "), "Not available"])
             r = rdf.iloc[0]
             return html.Li([html.Strong(f"{label}: "), fmt(r)])
 
@@ -2476,18 +3667,25 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
         total_matches = int(current_state.get("total_matches", 1)) or 1
         pct = int(round(100 * (matches_done / total_matches)))
 
-        totals = current_state.get("totals", {})
-        leaderboard = (
-            pd.DataFrame([{"strategy": k, "total_points": v} for k, v in totals.items()])
-            .sort_values("total_points", ascending=True)
-            .reset_index(drop=True)
-        )
+        metrics = _tournament_metrics_frame(current_state)
+        metric = rank_metric if rank_metric in {"points_per_round", "total_points", "win_rate", "cooperation_rate"} else "points_per_round"
+        metric_labels = {
+            "points_per_round": "Points per round",
+            "total_points": "Total points",
+            "win_rate": "Win rate",
+            "cooperation_rate": "Cooperation rate",
+        }
+        leaderboard = metrics.sort_values(metric, ascending=True).reset_index(drop=True)
         leaderboard_fig = px.bar(
             leaderboard,
-            x="total_points",
+            x=metric,
             y="strategy",
+            color="cooperation_rate",
+            color_continuous_scale="RdYlGn",
+            range_color=[0, 1],
             orientation="h",
-            title="Live leaderboard (total points)",
+            title=f"Live leaderboard ({metric_labels[metric].lower()})",
+            hover_data=["total_points", "points_per_round", "win_rate", "cooperation_rate", "rounds_played"],
         )
         leaderboard_fig.update_layout(
             height=420,
@@ -2496,26 +3694,25 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             plot_bgcolor="rgba(0,0,0,0)",
         )
 
-        # Live counts: cooperate vs defect per strategy
-        rp_map = current_state.get("rounds_played", {}) or {}
-        coop_map = current_state.get("cooperate", {}) or {}
-        order = leaderboard.sort_values("total_points", ascending=False)["strategy"].tolist() if not leaderboard.empty else list((current_state.get("strategy_names", []) or []))
+        # Normalize moves so traversal order does not make early strategies look larger.
+        order = leaderboard.sort_values(metric, ascending=False)["strategy"].tolist()
         move_rows = []
-        for s in order:
-            rp = int(rp_map.get(s, 0))
-            c = int(coop_map.get(s, 0))
-            d = max(0, rp - c)
-            move_rows.append({"strategy": s, "move": "Cooperate", "count": c})
-            move_rows.append({"strategy": s, "move": "Defect", "count": d})
+        indexed = metrics.set_index("strategy") if not metrics.empty else pd.DataFrame()
+        for strategy in order:
+            row = indexed.loc[strategy]
+            move_rows.append({"strategy": strategy, "move": "Cooperate", "rate": row["cooperation_rate"], "count": round(row["cooperation_rate"] * row["rounds_played"])})
+            move_rows.append({"strategy": strategy, "move": "Defect", "rate": row["defection_rate"], "count": round(row["defection_rate"] * row["rounds_played"])})
         moves_df = pd.DataFrame(move_rows)
         moves_fig = px.bar(
             moves_df,
-            x="count",
+            x="rate",
             y="strategy",
             color="move",
-            barmode="group",
+            barmode="stack",
             orientation="h",
-            title="Live move counts (Cooperate vs Defect)",
+            title="Move mix (normalized per strategy)",
+            color_discrete_map={"Cooperate": "#2ca02c", "Defect": "#d62728"},
+            hover_data={"count": True, "rate": ":.1%"},
         )
         moves_fig.update_layout(
             height=420,
@@ -2525,6 +3722,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             legend_title_text="Move",
         )
         moves_fig.update_yaxes(autorange="reversed")
+        moves_fig.update_xaxes(range=[0, 1], tickformat=".0%", title="Share of moves")
 
         # Build match-level timeline series (fallback to a single snapshot if timeline empty)
         timeline = list(current_state.get("timeline", []))
@@ -2633,26 +3831,35 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
         )
         wl_fig.for_each_annotation(lambda a: a.update(text=a.text.replace("metric=", "").title()))
 
-        pie_df = pd.DataFrame([{"strategy": k, "total_points": int(v)} for k, v in totals.items()])
-        points_pie_fig = px.pie(
-            pie_df,
-            names="strategy",
-            values="total_points",
-            title="Share of total points",
-            hole=0.45,
+        points_pie_fig = px.scatter(
+            metrics,
+            x="cooperation_rate",
+            y="points_per_round",
+            color="win_rate",
+            size="matches_played",
+            size_max=28,
+            text="strategy",
+            color_continuous_scale="Viridis",
+            range_color=[0, 1],
+            title="Efficiency vs cooperation",
+            hover_data=["total_points", "rounds_played", "matches_played"],
         )
         points_pie_fig.update_layout(
             height=520,
             margin=dict(l=10, r=10, t=60, b=10),
             paper_bgcolor="rgba(0,0,0,0)",
         )
+        points_pie_fig.update_xaxes(range=[0, 1], tickformat=".0%", title="Cooperation rate")
+        points_pie_fig.update_yaxes(range=[0, 5], title="Points per round")
+        points_pie_fig.update_traces(textposition="top center")
 
         recent_raw = list(current_state.get("recent", []))
         recent = recent_raw
         cols = []
 
         # Support compact recent format from game_logic:
-        # [rep, i, j, round, move1, move2, points1, points2]
+        # v1: [rep, i, j, round, move1, move2, points1, points2]
+        # v2 adds intended moves before executed moves.
         if recent_raw and isinstance(recent_raw[0], (list, tuple)):
             names = list(current_state.get("strategy_names", []) or [])
 
@@ -2662,7 +3869,11 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             recent = []
             for r in recent_raw:
                 try:
-                    rep_i, i, j, rnd, m1, m2, p1, p2 = r
+                    if len(r) == 10:
+                        rep_i, i, j, rnd, im1, im2, m1, m2, p1, p2 = r
+                    else:
+                        rep_i, i, j, rnd, m1, m2, p1, p2 = r
+                        im1, im2 = m1, m2
                     i = int(i)
                     j = int(j)
                     recent.append(
@@ -2671,6 +3882,8 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                             "strategy_1": names[i] if 0 <= i < len(names) else str(i),
                             "strategy_2": names[j] if 0 <= j < len(names) else str(j),
                             "round": int(rnd),
+                            "intended_move_1": _mv(im1),
+                            "intended_move_2": _mv(im2),
                             "move_1": _mv(m1),
                             "move_2": _mv(m2),
                             "points_1": int(p1),
@@ -2691,7 +3904,7 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             interval_disabled = True
             status = "Done."
 
-        # Provide a richer status line when possible
+        # Include match details when they are available
         if current_state and not done:
             s1 = current_state.get("s1")
             s2 = current_state.get("s2")
@@ -2700,9 +3913,9 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
             rep = int(current_state.get("rep", 0))
             reps_total = int(current_state.get("repetitions", 0))
             if bool(current_state.get("horizon_known", True)):
-                status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r}/{rpm})"
+                status = f"{status} Match {matches_done}/{total_matches} | Repetition {rep+1}/{reps_total}: {s1} vs {s2} (round {r}/{rpm})"
             else:
-                status = f"{status} Match {matches_done}/{total_matches} — Rep {rep+1}/{reps_total} — {s1} vs {s2} (round {r})"
+                status = f"{status} Match {matches_done}/{total_matches} | Repetition {rep+1}/{reps_total}: {s1} vs {s2} (round {r})"
 
         # Modal: show summary once, when the tournament completes
         modal_open = False
@@ -2775,6 +3988,8 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
                 repetitions=int(reps or 10),
                 seed=int(seed or 0),
                 horizon_known=bool(horizon_known),
+                include_self_play=bool(include_self_play),
+                execution_error_rate=float(execution_error_rate or 0.0),
                 recent_limit=recent_limit,
                 timeline_limit=timeline_limit,
                 timeline_stride=timeline_stride,
@@ -2861,12 +4076,13 @@ def tournament_controller(_start, _stop, _reset, _close, _n, strategies, rounds,
     State("human-opponent", "value"),
     State("human-rounds", "value"),
     State("human-seed", "value"),
+    State("human-error-rate", "value"),
     State("sim-settings", "data"),
     State("custom-strategies", "data"),
     State("human-match-state", "data"),
     prevent_initial_call=True,
 )
-def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, custom_strategies, state):
+def play_human(new, coop, defect, reset, opponent, rounds, seed, execution_error_rate, sim_settings, custom_strategies, state):
     triggered = dash.ctx.triggered_id
 
     if triggered == "human-reset":
@@ -2882,6 +4098,7 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, c
                 rounds=int(rounds or 10),
                 seed=int(seed or 0),
                 horizon_known=bool(horizon_known),
+                execution_error_rate=float(execution_error_rate or 0.0),
                 custom_strategies=custom_map,
             )
         except Exception as e:
@@ -2905,11 +4122,11 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, c
     done = bool(state.get("done"))
 
     if bool(state.get("horizon_known", True)):
-        status = f"Round {r}/{total_r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
+        status = f"Round {r}/{total_r} | You: {human_points} | {state.get('opponent')}: {opp_points}"
     else:
-        status = f"Round {r} — You: {human_points} | {state.get('opponent')}: {opp_points}"
+        status = f"Round {r} | You: {human_points} | {state.get('opponent')}: {opp_points}"
     if done:
-        status += " — Finished."
+        status += " | Finished."
 
     # cumulative score chart
     cum_h = []
@@ -2932,12 +4149,708 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, c
         )
     else:
         score_df = pd.DataFrame(cum_h + cum_o)
-    fig = px.line(score_df, x="round", y="score", color="player", title="Cumulative score")
-    fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.14,
+        subplot_titles=("Cumulative score and lead", "Round-by-round decisions"),
+    )
+    for player, player_rows in score_df.groupby("player"):
+        fig.add_trace(
+            go.Scatter(x=player_rows["round"], y=player_rows["score"], name=str(player), mode="lines+markers"),
+            row=1,
+            col=1,
+        )
+    if events:
+        rounds_x = [int(event["round"]) for event in events]
+        lead = []
+        running_lead = 0
+        for event in events:
+            running_lead += int(event["human_points"]) - int(event["opponent_points"])
+            lead.append(running_lead)
+        fig.add_trace(
+            go.Scatter(
+                x=rounds_x,
+                y=lead,
+                name="Your lead",
+                mode="lines",
+                line={"dash": "dot", "color": "#9467bd"},
+                hovertemplate="Round %{x}<br>Lead: %{y:+d}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        decision_z = [
+            [0 if event["human_move"] == "cooperate" else 1 for event in events],
+            [0 if event["opponent_move"] == "cooperate" else 1 for event in events],
+        ]
+        decision_text = [
+            [
+                ("C" if event["human_move"] == "cooperate" else "D")
+                if event.get("intended_human_move", event["human_move"]) == event["human_move"]
+                else f"{event['intended_human_move'][0].upper()}→{event['human_move'][0].upper()}"
+                for event in events
+            ],
+            [
+                ("C" if event["opponent_move"] == "cooperate" else "D")
+                if event.get("intended_opponent_move", event["opponent_move"]) == event["opponent_move"]
+                else f"{event['intended_opponent_move'][0].upper()}→{event['opponent_move'][0].upper()}"
+                for event in events
+            ],
+        ]
+        fig.add_trace(
+            go.Heatmap(
+                x=rounds_x,
+                y=["You", str(state.get("opponent"))],
+                z=decision_z,
+                text=decision_text,
+                texttemplate="%{text}",
+                colorscale=[[0, "#2ca02c"], [0.499, "#2ca02c"], [0.5, "#d62728"], [1, "#d62728"]],
+                showscale=False,
+                hovertemplate="Round %{x}<br>%{y}: %{text}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+    fig.update_layout(height=500, margin=dict(l=10, r=10, t=70, b=10), hovermode="x unified")
+    fig.update_xaxes(title_text="Round", row=2, col=1)
+    fig.update_yaxes(title_text="Score / lead", row=1, col=1)
 
     cols = [{"name": c, "id": c} for c in (events[0].keys() if events else [])]
     disabled = done
     return state, disabled, disabled, status, fig, cols, events[::-1]
+
+
+@callback(
+    Output("tournament-format-notice", "children"),
+    Output("tournament-format-notice", "color"),
+    Input("tournament-self-play", "value"),
+    Input("tournament-error-rate", "value"),
+)
+def update_tournament_format_notice(include_self_play, execution_error_rate):
+    return _game_format_notice(bool(include_self_play), float(execution_error_rate or 0.0))
+
+
+@callback(
+    Output("human-format-notice", "children"),
+    Output("human-format-notice", "color"),
+    Input("human-error-rate", "value"),
+)
+def update_human_format_notice(execution_error_rate):
+    return _game_format_notice(False, float(execution_error_rate or 0.0))
+
+
+@callback(
+    Output("evolution-population-size", "disabled"),
+    Input("evolution-model", "value"),
+)
+def toggle_evolution_population_size(model):
+    return model != "moran"
+
+
+def _experiment_insight_panel(title, insights):
+    """Render factual, data-derived observations for a completed experiment."""
+    if not insights:
+        return ""
+    return dbc.Card(
+        dbc.CardBody(
+            [
+                html.Span("RESULT HIGHLIGHTS", className="section-kicker"),
+                html.H4(title),
+                html.Ul([html.Li(insight) for insight in insights], className="mb-0"),
+            ]
+        ),
+        className="insight-panel",
+    )
+
+
+@callback(
+    Output("robustness-status", "children"),
+    Output("robustness-result", "data"),
+    Input("robustness-run", "n_clicks"),
+    Input("robustness-reset", "n_clicks"),
+    State("robustness-strategies", "value"),
+    State("robustness-start-seed", "value"),
+    State("robustness-seed-count", "value"),
+    State("robustness-seed-step", "value"),
+    State("robustness-rounds", "value"),
+    State("robustness-repetitions", "value"),
+    State("robustness-error-rate", "value"),
+    State("robustness-self-play", "value"),
+    State("robustness-horizon-known", "value"),
+    prevent_initial_call=True,
+)
+def run_robustness_sweep(
+    _run,
+    _reset,
+    strategies,
+    start_seed,
+    seed_count,
+    seed_step,
+    rounds,
+    repetitions,
+    error_rate,
+    include_self_play,
+    horizon_known,
+):
+    if dash.ctx.triggered_id == "robustness-reset":
+        return "Robustness result cleared.", None
+    try:
+        result = run_seed_sweep(
+            SeedSweepConfig(
+                strategy_names=tuple(strategies or []),
+                start_seed=int(start_seed or 0),
+                seed_count=int(seed_count or 10),
+                seed_step=int(seed_step if seed_step is not None else 1),
+                rounds_per_match=int(rounds or 50),
+                repetitions=int(repetitions or 3),
+                horizon_known=bool(horizon_known),
+                include_self_play=bool(include_self_play),
+                execution_error_rate=float(error_rate or 0.0),
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        return dbc.Alert(f"Seed sweep could not run: {exc}", color="danger"), None
+    status = dbc.Alert(
+        f"Completed {result['config']['seed_count']} independent seeds. This is an experimental robustness analysis of the selected tournament format.",
+        color="success",
+    )
+    return status, result
+
+
+@callback(
+    Output("robustness-payoff-chart", "figure"),
+    Output("robustness-rank-chart", "figure"),
+    Output("robustness-summary-table", "columns"),
+    Output("robustness-summary-table", "data"),
+    Input("robustness-result", "data"),
+)
+def render_robustness_result(result):
+    return _robustness_result_view(result)
+
+
+@callback(
+    Output("robustness-insights", "children"),
+    Input("robustness-result", "data"),
+)
+def render_robustness_insights(result):
+    return _experiment_insight_panel("What happened across seeds", _robustness_insights(result))
+
+
+@callback(
+    Output("robustness-ranking-chart", "figure"),
+    Output("robustness-ranking-statement", "children"),
+    Input("robustness-result", "data"),
+    Input("robustness-ranking-metric", "value"),
+    Input("robustness-ranking-chart", "clickData"),
+)
+def render_robustness_ranking(result, metric, click_data):
+    return _robustness_ranking_view(result, str(metric or "mean_payoff"), click_data)
+
+
+@callback(
+    Output("robustness-download", "data"),
+    Output("robustness-transfer-status", "children"),
+    Output("robustness-result", "data", allow_duplicate=True),
+    Input("robustness-export", "n_clicks"),
+    Input("robustness-import", "contents"),
+    State("robustness-result", "data"),
+    prevent_initial_call=True,
+)
+def transfer_robustness_result(_clicks, upload_contents, result):
+    try:
+        if dash.ctx.triggered_id == "robustness-export":
+            validated = validate_seed_sweep_result(result, list_strategy_names())
+            return (
+                dcc.send_string(json.dumps(validated, indent=2), "prisoners-dilemma-robustness-result.json"),
+                "Robustness result exported.",
+                dash.no_update,
+            )
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 2_000_000:
+            raise ValueError("result file exceeds 2 MB")
+        payload = json.loads(decoded.decode("utf-8"))
+        validated = validate_seed_sweep_result(payload, list_strategy_names())
+        return dash.no_update, "Robustness result opened. No tournaments were rerun.", validated
+    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Robustness result transfer failed: {exc}", dash.no_update
+
+
+@callback(
+    Output("robustness-seed-inspector", "options"),
+    Output("robustness-seed-inspector", "value"),
+    Input("robustness-result", "data"),
+)
+def configure_robustness_seed_inspector(result):
+    rows = list((result or {}).get("seed_results", []))
+    seeds = sorted({int(row["seed"]) for row in rows})
+    options = [{"label": f"Seed {seed}", "value": seed} for seed in seeds]
+    return options, seeds[0] if seeds else None
+
+
+@callback(
+    Output("robustness-seed-payoff-chart", "figure"),
+    Output("robustness-seed-cooperation-chart", "figure"),
+    Output("robustness-seed-table", "columns"),
+    Output("robustness-seed-table", "data"),
+    Input("robustness-result", "data"),
+    Input("robustness-seed-inspector", "value"),
+)
+def inspect_robustness_seed(result, seed):
+    return _robustness_seed_view(result, seed)
+
+
+@callback(
+    Output("evolution-population-table", "data"),
+    Input("evolution-strategies", "value"),
+    Input("evolution-preset", "value"),
+    Input("evolution-seed", "value"),
+    State("evolution-population-table", "data"),
+)
+def update_evolution_population(strategies, preset, seed, current_rows):
+    names = list(dict.fromkeys(strategies or []))
+    if not names:
+        return []
+    current = {
+        str(row.get("strategy")): float(row.get("share", 0))
+        for row in (current_rows or [])
+        if isinstance(row, dict) and row.get("strategy") in names
+    }
+    if dash.ctx.triggered_id == "evolution-strategies" and set(current) == set(names) and sum(current.values()) > 0:
+        total = sum(current.values())
+        shares = {name: current[name] / total for name in names}
+    elif preset == "invasion" and len(names) >= 2:
+        shares = {name: 0.0 for name in names}
+        shares[names[0]] = 0.99
+        shares[names[1]] = 0.01
+    elif preset == "random":
+        rng = random.Random(int(seed or 0))
+        weights = {name: rng.random() for name in names}
+        total = sum(weights.values()) or 1.0
+        shares = {name: value / total for name, value in weights.items()}
+    else:
+        shares = {name: 1.0 / len(names) for name in names}
+    return [{"strategy": name, "share": round(shares[name], 8)} for name in names]
+
+
+@callback(
+    Output("evolution-config-download", "data"),
+    Output("evolution-transfer-status", "children"),
+    Output("evolution-strategies", "value", allow_duplicate=True),
+    Output("evolution-generations", "value", allow_duplicate=True),
+    Output("evolution-rounds", "value", allow_duplicate=True),
+    Output("evolution-seed", "value", allow_duplicate=True),
+    Output("evolution-selection", "value", allow_duplicate=True),
+    Output("evolution-mutation", "value", allow_duplicate=True),
+    Output("evolution-repetitions", "value", allow_duplicate=True),
+    Output("evolution-error-rate", "value", allow_duplicate=True),
+    Output("evolution-horizon-known", "value", allow_duplicate=True),
+    Output("evolution-model", "value", allow_duplicate=True),
+    Output("evolution-population-size", "value", allow_duplicate=True),
+    Output("evolution-population-table", "data", allow_duplicate=True),
+    Input("evolution-export", "n_clicks"),
+    Input("evolution-import", "contents"),
+    State("evolution-strategies", "value"),
+    State("evolution-generations", "value"),
+    State("evolution-rounds", "value"),
+    State("evolution-seed", "value"),
+    State("evolution-selection", "value"),
+    State("evolution-mutation", "value"),
+    State("evolution-repetitions", "value"),
+    State("evolution-error-rate", "value"),
+    State("evolution-horizon-known", "value"),
+    State("evolution-model", "value"),
+    State("evolution-population-size", "value"),
+    State("evolution-population-table", "data"),
+    prevent_initial_call=True,
+)
+def transfer_evolution_config(_export, upload_contents, strategies, generations, rounds, seed, selection, mutation, repetitions, error_rate, horizon_known, model, population_size, population_rows):
+    unchanged = (dash.no_update,) * 12
+    try:
+        if dash.ctx.triggered_id == "evolution-export":
+            shares = {
+                str(row.get("strategy")): float(row.get("share", 0))
+                for row in (population_rows or [])
+                if isinstance(row, dict) and row.get("strategy")
+            }
+            config = normalize_evolution_config(
+                EvolutionConfig(
+                    strategy_names=tuple(strategies or []),
+                    initial_shares=shares,
+                    generations=int(generations or 100),
+                    rounds_per_match=int(rounds or 20),
+                    repetitions=int(repetitions or 3),
+                    seed=int(seed or 0),
+                    selection_strength=float(selection if selection is not None else 1.0),
+                    mutation_rate=float(mutation or 0.0),
+                    execution_error_rate=float(error_rate or 0.0),
+                    horizon_known=bool(horizon_known),
+                    model=str(model or "replicator"),
+                    population_size=int(population_size or 100),
+                )
+            )
+            payload = {
+                "schema_version": 1,
+                "experiment_type": "evolution",
+                "game": "prisoners_dilemma",
+                "game_version": 1,
+                "config": config.to_dict(),
+            }
+            return dcc.send_string(json.dumps(payload, indent=2), "prisoners-dilemma-evolution.json"), "Evolution settings exported.", *unchanged
+
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 100_000:
+            raise ValueError("configuration file exceeds 100 KB")
+        payload = json.loads(decoded.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("unsupported or missing schema_version")
+        if payload.get("experiment_type") != "evolution":
+            raise ValueError("experiment_type must be evolution")
+        if payload.get("game") != "prisoners_dilemma" or payload.get("game_version") != 1:
+            raise ValueError("unsupported game or game_version")
+        raw = payload.get("config")
+        if not isinstance(raw, dict):
+            raise ValueError("config must be an object")
+        config = normalize_evolution_config(
+            EvolutionConfig(
+                strategy_names=tuple(raw.get("strategy_names", [])),
+                initial_shares=dict(raw.get("initial_shares", {})),
+                generations=raw.get("generations", 100),
+                rounds_per_match=raw.get("rounds_per_match", 20),
+                repetitions=raw.get("repetitions", 3),
+                seed=raw.get("seed", 0),
+                selection_strength=raw.get("selection_strength", 1.0),
+                mutation_rate=raw.get("mutation_rate", 0.0),
+                execution_error_rate=raw.get("execution_error_rate", 0.0),
+                horizon_known=raw.get("horizon_known", False),
+                model=raw.get("model", "replicator"),
+                population_size=raw.get("population_size", 100),
+            )
+        )
+        unknown = sorted(set(config.strategy_names) - set(list_strategy_names()))
+        if unknown:
+            raise ValueError(f"unknown evolution strategies: {', '.join(unknown)}")
+        rows = [{"strategy": name, "share": config.initial_shares[name]} for name in config.strategy_names]
+        return (
+            dash.no_update,
+            "Evolution settings imported. Review them before running.",
+            list(config.strategy_names),
+            config.generations,
+            config.rounds_per_match,
+            config.seed,
+            config.selection_strength,
+            config.mutation_rate,
+            config.repetitions,
+            config.execution_error_rate,
+            config.horizon_known,
+            config.model,
+            config.population_size,
+            rows,
+        )
+    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Evolution import failed: {exc}", *unchanged
+
+
+@callback(
+    Output("evolution-status", "children"),
+    Output("evolution-population-chart", "figure"),
+    Output("evolution-outcomes-chart", "figure"),
+    Output("evolution-final-table", "columns"),
+    Output("evolution-final-table", "data"),
+    Output("evolution-result", "data"),
+    Input("evolution-run", "n_clicks"),
+    Input("evolution-reset", "n_clicks"),
+    State("evolution-strategies", "value"),
+    State("evolution-generations", "value"),
+    State("evolution-rounds", "value"),
+    State("evolution-seed", "value"),
+    State("evolution-selection", "value"),
+    State("evolution-mutation", "value"),
+    State("evolution-repetitions", "value"),
+    State("evolution-error-rate", "value"),
+    State("evolution-horizon-known", "value"),
+    State("evolution-model", "value"),
+    State("evolution-population-size", "value"),
+    State("evolution-population-table", "data"),
+    prevent_initial_call=True,
+)
+def run_evolution(_clicks, _reset, strategies, generations, rounds, seed, selection_strength, mutation_rate, repetitions, error_rate, horizon_known, model, population_size, population_rows):
+    if dash.ctx.triggered_id == "evolution-reset":
+        empty = go.Figure()
+        return "Evolution result cleared.", empty, empty, [], [], None
+    names = list(strategies or [])
+    try:
+        initial_shares = {
+            str(row.get("strategy")): float(row.get("share", 0))
+            for row in (population_rows or [])
+            if isinstance(row, dict) and row.get("strategy") in names
+        }
+        config = normalize_evolution_config(
+            EvolutionConfig(
+                strategy_names=tuple(names),
+                initial_shares=initial_shares,
+                generations=int(generations or 100),
+                rounds_per_match=int(rounds or 20),
+                repetitions=int(repetitions or 3),
+                seed=int(seed or 0),
+                selection_strength=float(selection_strength if selection_strength is not None else 1.0),
+                mutation_rate=float(mutation_rate or 0.0),
+                execution_error_rate=float(error_rate or 0.0),
+                horizon_known=bool(horizon_known),
+                model=str(model or "replicator"),
+                population_size=int(population_size or 100),
+            )
+        )
+        results = simulate_tournament(
+            strategy_names=list(config.strategy_names),
+            rounds_per_match=config.rounds_per_match,
+            repetitions=config.repetitions,
+            seed=config.seed,
+            horizon_known=config.horizon_known,
+            include_self_play=True,
+            execution_error_rate=config.execution_error_rate,
+        )
+        stats = matchup_statistics(results, names)
+        if config.model == "moran":
+            history = evolve_moran_population(
+                names,
+                stats,
+                generations=config.generations,
+                population_size=config.population_size,
+                initial_shares=config.initial_shares,
+                selection_strength=config.selection_strength,
+                mutation_rate=config.mutation_rate,
+                seed=config.seed,
+            )
+        else:
+            history = evolve_population(
+                names,
+                stats,
+                generations=config.generations,
+                initial_shares=config.initial_shares,
+                selection_strength=config.selection_strength,
+                mutation_rate=config.mutation_rate,
+            )
+    except (TypeError, ValueError) as exc:
+        empty = go.Figure()
+        return dbc.Alert(f"Evolution could not run: {exc}", color="danger"), empty, empty, [], [], None
+
+    population_figure, outcomes_figure, columns, table_rows = _evolution_result_view(history, names)
+    status = dbc.Alert(
+        f"Completed {config.generations} generations with the {config.model} model. This experimental population model uses the classic Prisoner’s Dilemma payoff matrix.",
+        color="success",
+    )
+    result_state = build_evolution_result(config, history, stats)
+    return status, population_figure, outcomes_figure, columns, table_rows, result_state
+
+
+@callback(
+    Output("evolution-insights", "children"),
+    Input("evolution-result", "data"),
+)
+def render_evolution_insights(result_state):
+    return _experiment_insight_panel("What changed in the population", _evolution_insights(result_state))
+
+
+@callback(
+    Output("evolution-result-download", "data"),
+    Output("evolution-result-transfer-status", "children"),
+    Output("evolution-result", "data", allow_duplicate=True),
+    Input("evolution-result-export", "n_clicks"),
+    Input("evolution-result-import", "contents"),
+    State("evolution-result", "data"),
+    prevent_initial_call=True,
+)
+def transfer_evolution_result(_export, upload_contents, result_state):
+    """Export a completed run or open one for read-only generation inspection."""
+    try:
+        if dash.ctx.triggered_id == "evolution-result-export":
+            validated = validate_evolution_result(result_state, list_strategy_names())
+            return (
+                dcc.send_string(json.dumps(validated, indent=2), "prisoners-dilemma-evolution-result.json"),
+                "Evolution result exported.",
+                dash.no_update,
+            )
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 2_000_000:
+            raise ValueError("result file exceeds 2 MB")
+        payload = json.loads(decoded.decode("utf-8"))
+        validated = validate_evolution_result(payload, list_strategy_names())
+        return dash.no_update, "Evolution result opened in read-only inspection mode. No matches were rerun.", validated
+    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Evolution result transfer failed: {exc}", dash.no_update
+
+
+@callback(
+    Output("evolution-generation", "max"),
+    Output("evolution-generation", "marks"),
+    Output("evolution-generation", "value"),
+    Input("evolution-result", "data"),
+)
+def configure_evolution_generation_slider(result_state):
+    history = list((result_state or {}).get("history", []))
+    if not history:
+        return 1, {0: "0"}, 0
+    maximum = int(history[-1].get("generation", len(history) - 1))
+    step = max(1, maximum // 5)
+    marks = {value: str(value) for value in range(0, maximum + 1, step)}
+    marks[maximum] = str(maximum)
+    return maximum, marks, maximum
+
+
+@callback(
+    Output("evolution-generation-summary", "children"),
+    Output("evolution-generation-table", "columns"),
+    Output("evolution-generation-table", "data"),
+    Output("evolution-event-log", "children"),
+    Input("evolution-result", "data"),
+    Input("evolution-generation", "value"),
+)
+def inspect_evolution_generation(result_state, generation):
+    history = list((result_state or {}).get("history", []))
+    if not history:
+        return "Run an evolution experiment to inspect its generations.", [], [], "No events."
+    index = max(0, min(int(generation or 0), len(history) - 1))
+    current = history[index]
+    previous = history[index - 1] if index > 0 else None
+    shares = dict(current.get("shares", {}))
+    fitness = dict(current.get("fitness", {}))
+    previous_shares = dict(previous.get("shares", {})) if previous else shares
+    table_rows = [
+        {
+            "strategy": name,
+            "share": float(share),
+            "change": float(share) - float(previous_shares.get(name, 0.0)),
+            "fitness": float(fitness.get(name, 0.0)),
+        }
+        for name, share in shares.items()
+    ]
+    table_rows.sort(key=lambda row: row["share"], reverse=True)
+    columns = [
+        {"name": "Strategy", "id": "strategy"},
+        {"name": "Share", "id": "share", "type": "numeric", "format": {"specifier": ".1%"}},
+        {"name": "Change", "id": "change", "type": "numeric", "format": {"specifier": "+.2%"}},
+        {"name": "Fitness", "id": "fitness", "type": "numeric", "format": {"specifier": ".3f"}},
+    ]
+    leader = table_rows[0]["strategy"] if table_rows else "Not available"
+    summary = dbc.Row(
+        [
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Generation"), html.H4(str(index))])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Largest population"), html.H4(leader)])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Average payoff"), html.H4(f"{float(current.get('average_payoff', 0)):.3f}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Cooperation"), html.H4(f"{float(current.get('cooperation_rate', 0)):.1%}")])), md=3),
+        ],
+        className="g-2 mb-3",
+    )
+    events = [event for event in list((result_state or {}).get("events", [])) if int(event.get("generation", 0)) <= index]
+    event_children = (
+        html.Ul([html.Li([html.Strong(f"Generation {event['generation']}: "), str(event["message"])]) for event in events])
+        if events
+        else html.P("No recorded events through this generation.", className="muted")
+    )
+    return summary, columns, table_rows, event_children
+
+
+@callback(
+    Output("evolution-generation-ranking", "figure"),
+    Output("evolution-generation-ranking-statement", "children"),
+    Input("evolution-result", "data"),
+    Input("evolution-generation", "value"),
+)
+def render_evolution_generation_ranking(result_state, generation):
+    return _evolution_generation_ranking_view(result_state, generation)
+
+
+@callback(
+    Output("custom-start-move", "value"),
+    Output("custom-response-mode", "value"),
+    Output("custom-toggles", "value"),
+    Output("custom-retaliation-window", "value"),
+    Output("custom-defect-threshold", "value"),
+    Output("custom-min-history", "value"),
+    Output("custom-endgame-after", "value"),
+    Output("custom-noise", "value"),
+    Input("custom-recipe", "value"),
+)
+def apply_custom_recipe(recipe):
+    """Translate approachable recipes into the builder's explicit rule controls."""
+    recipes = {
+        "peacemaker": ("cooperate", "soft_majority", ["threshold"], 0, 0.65, 4, 0, 0.0),
+        "sentry": ("cooperate", "fixed", [], 3, 0.5, 3, 0, 0.0),
+        "chaos": ("defect", "anti_tft", [], 0, 0.5, 3, 0, 0.12),
+        "betrayal": ("cooperate", "fixed", [], 0, 0.5, 3, 12, 0.0),
+    }
+    return recipes.get(recipe, ("cooperate", "fixed", [], 0, 0.5, 3, 0, 0.0))
+
+
+@callback(
+    Output("custom-preview-figure", "figure"),
+    Output("custom-preview-summary", "children"),
+    Output("custom-preview-table", "columns"),
+    Output("custom-preview-table", "data"),
+    Input("custom-preview-scenario", "value"),
+    Input("custom-start-move", "value"),
+    Input("custom-response-mode", "value"),
+    Input("custom-toggles", "value"),
+    Input("custom-retaliation-window", "value"),
+    Input("custom-defect-threshold", "value"),
+    Input("custom-min-history", "value"),
+    Input("custom-endgame-after", "value"),
+    Input("custom-noise", "value"),
+)
+def update_custom_preview(scenario, start_move, response_mode, toggles, retaliation_window, threshold, min_history, endgame, noise):
+    scripts = {
+        "cooperate": ["cooperate"] * 12,
+        "defect": ["defect"] * 12,
+        "alternator": ["cooperate", "defect"] * 6,
+        "betrayal": ["cooperate"] * 4 + ["defect"] + ["cooperate"] * 7,
+        "burst": ["cooperate"] * 3 + ["defect"] * 3 + ["cooperate"] * 6,
+    }
+    opponent_moves = scripts.get(str(scenario), scripts["betrayal"])
+    enabled = set(toggles or [])
+    config = {
+        "start_move": "cooperate" if start_move == "cooperate" else "defect",
+        "response_mode": response_mode or "fixed",
+        "use_tft": False,
+        "use_grudge": "grudge" in enabled,
+        "retaliation_window": int(retaliation_window or 0),
+        "threshold_enabled": "threshold" in enabled,
+        "defect_rate_threshold": float(threshold if threshold is not None else 1.0),
+        "min_history": int(min_history or 0),
+        "endgame_after_turn": int(endgame or 0),
+        "noise": float(noise or 0.0),
+    }
+    rows = _custom_preview_rows(config, opponent_moves)
+    rounds = [row["round"] for row in rows]
+    z = [
+        [0 if row["custom_move"] == "cooperate" else 1 for row in rows],
+        [0 if row["opponent_move"] == "cooperate" else 1 for row in rows],
+    ]
+    text_values = [["C" if value == 0 else "D" for value in row] for row in z]
+    figure = go.Figure(
+        go.Heatmap(
+            x=rounds,
+            y=["Your strategy", "Scripted opponent"],
+            z=z,
+            text=text_values,
+            texttemplate="%{text}",
+            colorscale=[[0, "#2ca02c"], [0.499, "#2ca02c"], [0.5, "#d62728"], [1, "#d62728"]],
+            showscale=False,
+            hovertemplate="Round %{x}<br>%{y}: %{text}<extra></extra>",
+        )
+    )
+    figure.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=35), xaxis_title="Round")
+    total = sum(row["custom_points"] for row in rows)
+    opponent_total = sum(row["opponent_points"] for row in rows)
+    cooperation = sum(row["custom_move"] == "cooperate" for row in rows) / len(rows)
+    summary = f"Preview score: {total}–{opponent_total} · Cooperation: {cooperation:.0%} · Seeded noise preview is repeatable."
+    columns = [{"name": name.replace("_", " ").title(), "id": name} for name in rows[0]]
+    return figure, summary, columns, rows
 
 
 @callback(
@@ -2951,7 +4864,9 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, sim_settings, c
     Input("custom-clear", "n_clicks"),
     State("custom-strategy-name", "value"),
     State("custom-start-move", "value"),
+    State("custom-response-mode", "value"),
     State("custom-toggles", "value"),
+    State("custom-retaliation-window", "value"),
     State("custom-defect-threshold", "value"),
     State("custom-min-history", "value"),
     State("custom-endgame-after", "value"),
@@ -2964,7 +4879,9 @@ def manage_custom_strategies(
     _clear,
     name,
     start_move,
+    response_mode,
     toggles,
+    retaliation_window,
     defect_threshold,
     min_history,
     endgame_after,
@@ -2991,15 +4908,17 @@ def manage_custom_strategies(
                 {
                     "name": s.get("name"),
                     "start_move": cfg.get("start_move"),
-                    "use_tft": bool(cfg.get("use_tft")),
+                    "response": cfg.get("response_mode", "fixed"),
                     "use_grudge": bool(cfg.get("use_grudge")),
+                    "retaliation_window": cfg.get("retaliation_window", 0),
+                    "threshold_enabled": bool(cfg.get("threshold_enabled")),
                     "defect_rate_threshold": cfg.get("defect_rate_threshold"),
                     "min_history": cfg.get("min_history"),
                     "endgame_after_turn": cfg.get("endgame_after_turn"),
                     "noise": cfg.get("noise"),
                 }
             )
-        cols = [{"name": c, "id": c} for c in (rows[0].keys() if rows else ["name", "start_move", "use_tft", "use_grudge", "defect_rate_threshold", "min_history", "endgame_after_turn", "noise"])]
+        cols = [{"name": c, "id": c} for c in (rows[0].keys() if rows else ["name", "start_move", "response", "use_grudge", "retaliation_window", "threshold_enabled", "defect_rate_threshold", "min_history", "endgame_after_turn", "noise"])]
         return cols, rows
 
     triggered = dash.ctx.triggered_id
@@ -3022,8 +4941,11 @@ def manage_custom_strategies(
         toggles = set(toggles or [])
         cfg = {
             "start_move": "cooperate" if start_move == "cooperate" else "defect",
-            "use_tft": ("tft" in toggles),
+            "response_mode": response_mode or "fixed",
+            "use_tft": False,
             "use_grudge": ("grudge" in toggles),
+            "retaliation_window": int(retaliation_window or 0),
+            "threshold_enabled": ("threshold" in toggles),
             "defect_rate_threshold": float(defect_threshold if defect_threshold is not None else 1.0),
             "min_history": int(min_history or 0),
             "endgame_after_turn": int(endgame_after or 0),
