@@ -1,0 +1,35 @@
+name: Verify deployment
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: HTTPS origin to verify, without a trailing path
+        required: true
+        type: string
+      minimum_strategies:
+        description: Minimum expected strategy count
+        required: true
+        default: "100"
+        type: string
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify public deployment contract
+        env:
+          DEPLOYMENT_BASE_URL: ${{ inputs.base_url }}
+          MINIMUM_STRATEGIES: ${{ inputs.minimum_strategies }}
+        run: >-
+          python -m scripts.verify_deployment
+          "$DEPLOYMENT_BASE_URL"
+          --minimum-strategies "$MINIMUM_STRATEGIES"
