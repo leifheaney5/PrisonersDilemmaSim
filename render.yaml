@@ -5,4 +5,13 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn pages.app:server --bind 0.0.0.0:$PORT --workers 2 --threads 2 --timeout 120 --access-logfile - --error-logfile - --capture-output
-
+    healthCheckPath: /health/ready
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: MAX_REQUEST_BYTES
+        value: 3000000
+      - key: HEAVY_REQUESTS_PER_MINUTE
+        value: 8
