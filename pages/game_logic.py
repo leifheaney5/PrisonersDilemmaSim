@@ -74,6 +74,15 @@ class Strategy:
     def play(self, opponent_history: list[Move]) -> Move:
         raise NotImplementedError
 
+    def record_executed_move(self, move: Move) -> None:
+        """Synchronize self-memory after execution noise changes an action."""
+
+        # Stateful strategies consistently use ``last_move`` for the action
+        # whose outcome they will evaluate on their next turn.  Stateless
+        # strategies need no update.
+        if hasattr(self, "last_move"):
+            self.last_move = move
+
 
 # ----------------------------
 # Number helpers (for novelty strategies)
@@ -1604,6 +1613,8 @@ def simulate_tournament(
                             m1 = "defect" if m1 == "cooperate" else "cooperate"
                         if rng.random() < execution_error_rate:
                             m2 = "defect" if m2 == "cooperate" else "cooperate"
+                    s1.record_executed_move(m1)
+                    s2.record_executed_move(m2)
                     history1.append(m1)
                     history2.append(m2)
 
@@ -1687,6 +1698,14 @@ def _lcg_next(state: int) -> int:
 def _lcg_float01(state: int) -> tuple[float, int]:
     state = _lcg_next(state)
     return (state / float(2**32)), state
+
+
+def _record_executed_move(state: dict, move: Move) -> dict:
+    """Update JSON strategy state when execution differs from intention."""
+
+    if "last_move" in state:
+        state = {**state, "last_move": move}
+    return state
 
 
 def _init_strategy_state(name: str, custom_config: Optional[dict] = None) -> dict:
@@ -2766,8 +2785,8 @@ def step_tournament(state: dict, *, max_rounds: int = 500) -> dict:
             if error_draw < error_rate:
                 m2 = "defect" if m2 == "cooperate" else "cooperate"
 
-        state["s1_state"] = s1_state
-        state["s2_state"] = s2_state
+        state["s1_state"] = _record_executed_move(s1_state, m1)
+        state["s2_state"] = _record_executed_move(s2_state, m2)
         state["rng_state"] = rng_state
 
         history1.append(m1)
@@ -2913,7 +2932,7 @@ def step_human_match(state: dict, *, human_move: Move) -> dict:
             opp_move = "defect" if opp_move == "cooperate" else "cooperate"
 
     state["rng_state"] = rng_state
-    state["opponent_state"] = opp_state
+    state["opponent_state"] = _record_executed_move(opp_state, opp_move)
 
     # update histories
     state["human_history"].append(human_move)
