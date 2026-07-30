@@ -695,6 +695,15 @@ class ReproducibilityTests(unittest.TestCase):
         second = simulate_tournament(rounds_per_match=2, repetitions=1, seed=11, execution_error_rate=0.25)
         self.assertTrue(first.equals(second))
 
+    def test_batch_execution_error_updates_strategy_self_memory(self):
+        results = simulate_tournament(
+            strategy_names=["WinStayLoseShift", "MrNiceGuy"],
+            rounds_per_match=2,
+            repetitions=1,
+            execution_error_rate=1.0,
+        )
+        self.assertEqual(results["intended_move_1"].tolist(), ["cooperate", "cooperate"])
+
     def test_human_execution_error_preserves_intention(self):
         state = init_human_match_state(opponent="MrNiceGuy", rounds=1, seed=3, execution_error_rate=1.0)
         finished = step_human_match(state, human_move="cooperate")
@@ -703,6 +712,17 @@ class ReproducibilityTests(unittest.TestCase):
         self.assertEqual(event["human_move"], "defect")
         self.assertEqual(event["intended_opponent_move"], "cooperate")
         self.assertEqual(event["opponent_move"], "defect")
+
+    def test_human_execution_error_updates_opponent_self_memory(self):
+        state = init_human_match_state(
+            opponent="WinStayLoseShift", rounds=2, seed=3, execution_error_rate=1.0
+        )
+        state = step_human_match(state, human_move="cooperate")
+        state = step_human_match(state, human_move="cooperate")
+        self.assertEqual(
+            [event["intended_opponent_move"] for event in state["events"]],
+            ["cooperate", "cooperate"],
+        )
 
     def test_self_play_adds_diagonal_pairings(self):
         names = list_strategy_names()
@@ -734,6 +754,16 @@ class ReproducibilityTests(unittest.TestCase):
         self.assertEqual(state["recent_format"], "compact_v2")
         row = state["recent"][0]
         self.assertEqual(row[4:8], [0, 1, 1, 0])
+
+    def test_incremental_error_updates_strategy_self_memory(self):
+        state = init_tournament_state(
+            strategy_names=["WinStayLoseShift", "MrNiceGuy"],
+            rounds_per_match=2,
+            repetitions=1,
+            execution_error_rate=1.0,
+        )
+        state = step_tournament(state, max_rounds=2)
+        self.assertEqual([row[4] for row in state["recent"]], [0, 0])
 
     @staticmethod
     def _complete_tournament(max_rounds):
