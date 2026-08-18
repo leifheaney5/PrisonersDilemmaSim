@@ -24,10 +24,7 @@ try:
         init_human_match_state,
         init_tournament_state,
         _init_strategy_state,
-<<<<<<< HEAD
         explain_custom_strategy_decision,
-=======
->>>>>>> origin/main
         list_strategy_names,
         payoff,
         play_strategy,
@@ -42,10 +39,7 @@ except ImportError:
         init_human_match_state,
         init_tournament_state,
         _init_strategy_state,
-<<<<<<< HEAD
         explain_custom_strategy_decision,
-=======
->>>>>>> origin/main
         list_strategy_names,
         payoff,
         play_strategy,
@@ -286,15 +280,11 @@ def _custom_preview_rows(config: dict, opponent_moves: list[str], seed: int = 0)
     rows = []
     rng_state = seed & 0xFFFFFFFF
     for round_number, opponent_move in enumerate(opponent_moves, start=1):
-<<<<<<< HEAD
         turn = int(state.get("turn", 0)) + 1
         move, next_rng_state, trace = explain_custom_strategy_decision(config, history, turn, rng_state)
         engine_move, state, rng_state = play_strategy(name, history, state, rng_state)
         if engine_move != move or rng_state != next_rng_state:
             raise RuntimeError("Custom preview trace diverged from the strategy engine")
-=======
-        move, state, rng_state = play_strategy(name, history, state, rng_state)
->>>>>>> origin/main
         player_points, opponent_points = payoff(move, opponent_move)
         rows.append(
             {
@@ -303,19 +293,15 @@ def _custom_preview_rows(config: dict, opponent_moves: list[str], seed: int = 0)
                 "opponent_move": opponent_move,
                 "custom_points": player_points,
                 "opponent_points": opponent_points,
-<<<<<<< HEAD
                 "base_rule": trace["base_rule"],
                 "safety_rule": trace["safety_rule"],
                 "threshold_rule": trace["threshold_rule"],
                 "endgame_rule": trace["endgame_rule"],
                 "noise_flip": "Yes" if trace["noise_flip"] else "No",
-=======
->>>>>>> origin/main
             }
         )
         history.append(opponent_move)
     return rows
-<<<<<<< HEAD
 
 
 def _game_format_notice(include_self_play: bool = False, execution_error_rate: float = 0.0) -> tuple[str, str]:
@@ -347,8 +333,6 @@ def _payoff_lesson_result(player_move: str, opponent_move: str) -> dict[str, obj
         "combined_points": player_points + opponent_points,
         "explanation": explanation,
     }
-=======
->>>>>>> origin/main
 
 app.layout = html.Div(
     id="app-shell",
@@ -1539,22 +1523,6 @@ def experiment_page() -> html.Div:
                                                             min=0.0,
                                                             max=1.0,
                                                             step=0.01,
-<<<<<<< HEAD
-=======
-                                                        ),
-                                                    ],
-                                                    md=4,
-                                                ),
-                                                dbc.Col(
-                                                    [
-                                                        html.Div(
-                                                            [
-                                                                dbc.Button("Start", id="tournament-start", color="success"),
-                                                                dbc.Button("Stop", id="tournament-stop", color="secondary", outline=True),
-                                                                dbc.Button("Reset", id="tournament-reset", color="danger", outline=True),
-                                                            ],
-                                                            className="btn-row",
->>>>>>> origin/main
                                                         ),
                                                     ],
                                                     md=4,
@@ -1592,28 +1560,6 @@ def experiment_page() -> html.Div:
                                         html.Div(
                                             [html.Span("UNDERSTAND", className="section-kicker"), html.H4("Live analysis"), html.P("Review scores, decisions, outcomes, and rankings as matches finish.", className="muted mb-0")],
                                             className="lab-section-heading",
-                                        ),
-                                        dbc.Row(
-                                            [
-                                                dbc.Col(
-                                                    [
-                                                        dbc.Label("Rank leaderboard by"),
-                                                        dcc.Dropdown(
-                                                            id="tournament-rank-metric",
-                                                            options=[
-                                                                {"label": "Points per round", "value": "points_per_round"},
-                                                                {"label": "Total points", "value": "total_points"},
-                                                                {"label": "Win rate", "value": "win_rate"},
-                                                                {"label": "Cooperation rate", "value": "cooperation_rate"},
-                                                            ],
-                                                            value="points_per_round",
-                                                            clearable=False,
-                                                        ),
-                                                    ],
-                                                    md=4,
-                                                ),
-                                            ],
-                                            className="g-2 mb-2",
                                         ),
                                         dbc.Row(
                                             [
@@ -1795,11 +1741,7 @@ def experiment_page() -> html.Div:
                                         ),
                                         html.H5("Custom strategy builder"),
                                         html.P(
-<<<<<<< HEAD
                                             "Set the rules, preview the resulting decisions, and add the strategy to a tournament.",
-=======
-                                            "Compose a policy from readable rules, see exactly how conflicts are resolved, then test it in a tournament.",
->>>>>>> origin/main
                                             className="muted",
                                         ),
                                         dbc.Alert(
@@ -1814,19 +1756,11 @@ def experiment_page() -> html.Div:
                                                     dcc.Dropdown(
                                                         id="custom-recipe",
                                                         options=[
-<<<<<<< HEAD
                                                             {"label": "No preset", "value": "blank"},
                                                             {"label": "Forgiving majority", "value": "peacemaker"},
                                                             {"label": "Three-turn retaliation", "value": "sentry"},
                                                             {"label": "Anti-mirror with noise", "value": "chaos"},
                                                             {"label": "Late defection", "value": "betrayal"},
-=======
-                                                            {"label": "Fresh canvas", "value": "blank"},
-                                                            {"label": "Peacemaker — forgiving majority", "value": "peacemaker"},
-                                                            {"label": "Sentry — three-turn retaliation", "value": "sentry"},
-                                                            {"label": "Chaos Goblin — anti-mirror + noise", "value": "chaos"},
-                                                            {"label": "Late Betrayal — cooperate, then defect", "value": "betrayal"},
->>>>>>> origin/main
                                                         ],
                                                         value="blank",
                                                         clearable=False,
@@ -1978,15 +1912,11 @@ def experiment_page() -> html.Div:
                                             className="g-3",
                                         ),
                                         html.H5("Live strategy preview"),
-<<<<<<< HEAD
                                         html.P(
                                             "Test the current controls before saving. Green cells cooperate; red cells defect. "
                                             "The decision trace explains which rule produced every move.",
                                             className="muted",
                                         ),
-=======
-                                        html.P("Test the current controls before saving. Green cells cooperate; red cells defect.", className="muted"),
->>>>>>> origin/main
                                         dbc.Row(
                                             dbc.Col(
                                                 [
@@ -2155,11 +2085,7 @@ def update_matchup_matrix(metric: str, sim_settings: dict):
         zmax=color_range[1],
         aspect="auto",
         labels={"x": "Opponent", "y": "Strategy", "color": labels[selected]},
-<<<<<<< HEAD
         title=f"Pairwise matchup matrix: {labels[selected].lower()}",
-=======
-        title=f"Pairwise matchup matrix — {labels[selected].lower()}",
->>>>>>> origin/main
     )
     figure.update_layout(height=760, margin=dict(l=10, r=10, t=60, b=10))
     return figure
@@ -3447,7 +3373,6 @@ def play_human(new, coop, defect, reset, opponent, rounds, seed, execution_error
 
 
 @callback(
-<<<<<<< HEAD
     Output("tournament-format-notice", "children"),
     Output("tournament-format-notice", "color"),
     Input("tournament-self-play", "value"),
@@ -3467,8 +3392,6 @@ def update_human_format_notice(execution_error_rate):
 
 
 @callback(
-=======
->>>>>>> origin/main
     Output("custom-start-move", "value"),
     Output("custom-response-mode", "value"),
     Output("custom-toggles", "value"),

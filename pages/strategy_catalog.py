@@ -46,11 +46,7 @@ STRATEGY_PROFILES: dict[str, dict[str, str]] = {
     "CalculatedDefector": {
         "description": "Cooperates unless the opponent defects “too often” (threshold-based).",
         "origin": "Project-defined heuristic.",
-<<<<<<< HEAD
         "notes": "Tolerates occasional defection but punishes sustained defection.",
-=======
-        "notes": "Designed to tolerate occasional defection but punish sustained defection.",
->>>>>>> origin/main
     },
     "HoldingAGrudge": {
         "description": "Cooperates until the opponent defects once, then defects forever.",
@@ -155,11 +151,7 @@ STRATEGY_PROFILES: dict[str, dict[str, str]] = {
     "GenerousTitForTat": {
         "description": "Like TFT, but sometimes forgives defections and cooperates anyway (stochastic).",
         "origin": "Classic TFT variant (GTFT).",
-<<<<<<< HEAD
         "notes": "Uses controlled forgiveness to recover cooperation after occasional defections.",
-=======
-        "notes": "Designed to sustain cooperation under noise; introduces controlled forgiveness.",
->>>>>>> origin/main
     },
     "Joss": {
         "description": "TFT with occasional random defection ('spite') even after opponent cooperation.",
