@@ -106,7 +106,6 @@ try:
     from .strategy_catalog import STRATEGY_PROFILES, strategy_scorecard
 except ImportError:
     from strategy_catalog import STRATEGY_PROFILES, strategy_scorecard  # type: ignore
-
 try:
     from .evolution import (
         EvolutionConfig,
@@ -142,8 +141,6 @@ def get_results(rounds_per_match: int, repetitions: int, seed: int, horizon_know
         seed=seed,
         horizon_known=bool(horizon_known),
     )
-
-
 
 
 # ----------------------------
