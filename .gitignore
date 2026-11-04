@@ -19,3 +19,7 @@ Thumbs.db
 /results.csv
 /results*.csv
 
+# Browser test artifacts and dependencies
+node_modules/
+playwright-report/
+test-results/
