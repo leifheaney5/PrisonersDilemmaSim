@@ -263,6 +263,66 @@ STRATEGY_PROFILES: dict[str, dict[str, str]] = {
         "origin": "Project-defined hidden strategy.",
         "notes": "This strategy’s logic is intentionally not disclosed in the UI.",
     },
+    "ForgetfulGrudger": {
+        "description": "Punishes an opponent defection for ten decisions, then returns to cooperation.",
+        "origin": "Finite-memory variant of the common grudger strategy.",
+        "notes": "Unlike Grim Trigger, an old defection eventually leaves its active memory.",
+    },
+    "StochasticPavlov": {
+        "description": "Uses Win-Stay, Lose-Shift, then flips five percent of its decisions.",
+        "origin": "Stochastic variant of Pavlov / Win-Stay, Lose-Shift.",
+        "notes": "Tests whether outcome-based adaptation remains stable with decision noise.",
+    },
+    "Appeaser": {
+        "description": "Repeats its own action after cooperation and switches after opponent defection.",
+        "origin": "Common stateful IPD response strategy.",
+        "notes": "Its attempt to respond to aggression can produce unusual cycles.",
+    },
+    "Forgiver": {
+        "description": "Retaliates once after a defection, then makes a cooperative reconciliation move.",
+        "origin": "Deterministic forgiveness strategy.",
+        "notes": "Provides a simple comparison with probabilistic and escalating forgiveness rules.",
+    },
+    "ReactivePlayer": {
+        "description": "Cooperates with probability 90% after cooperation and 20% after defection.",
+        "origin": "Parameterized reactive R(p,q) strategy family.",
+        "notes": "A fixed research preset for comparing general reactive policies.",
+    },
+    "MemoryOnePlayer": {
+        "description": "Conditions cooperation probability on the previous CC, CD, DC, or DD outcome.",
+        "origin": "General memory-one strategy family.",
+        "notes": "Uses the probability vector (0.9, 0.2, 0.8, 0.1).",
+    },
+    "ZDExtort2": {
+        "description": "Uses an extortionate zero-determinant memory-one probability vector.",
+        "origin": "Advanced research strategy based on zero-determinant IPD policies.",
+        "notes": "Its theoretical payoff relationship is a long-run property and may be less visible in short or noisy matches.",
+    },
+    "ZDGenerous2": {
+        "description": "Uses a generous zero-determinant memory-one probability vector.",
+        "origin": "Advanced research strategy based on generous zero-determinant policies.",
+        "notes": "Designed for research comparisons with extortionate and ordinary memory-one strategies.",
+    },
+    "ZDEqualizer": {
+        "description": "Uses an equalizer-style memory-one probability preset.",
+        "origin": "Advanced research strategy in the zero-determinant family.",
+        "notes": "The profile exposes a fixed preset for finite and noisy tournament experiments.",
+    },
+    "Handshake": {
+        "description": "Emits C-D-C-C, cooperates with recognized copies, and defects otherwise.",
+        "origin": "Recognition strategy using only legal IPD actions.",
+        "notes": "Most informative when self-play or population evolution is enabled.",
+    },
+    "AdaptiveBestResponse": {
+        "description": "Estimates conditional cooperation and selects the action with greater expected payoff.",
+        "origin": "Project-defined interpretable opponent-modeling strategy.",
+        "notes": "Uses cooperative priors so its earliest observations do not dominate permanently.",
+    },
+    "HedgeMetaStrategy": {
+        "description": "Combines four simple policies using multiplicative expert weights.",
+        "origin": "Project-defined online expert-selection strategy.",
+        "notes": "Adapts the influence of cooperation, defection, Tit-for-Tat, and Pavlov recommendations.",
+    },
 }
 
 
@@ -307,6 +367,12 @@ def strategy_scorecard(name: str) -> dict[str, object]:
         "Shootout",
         "Illuminati",
         "PastTrauma",
+        "ForgetfulGrudger",
+        "Appeaser",
+        "Forgiver",
+        "Handshake",
+        "AdaptiveBestResponse",
+        "HedgeMetaStrategy",
     }
 
     stochastic = nm in {
@@ -327,6 +393,12 @@ def strategy_scorecard(name: str) -> dict[str, object]:
         "RandomStranger",
         "MarkedMan",
         "Lottery",
+        "StochasticPavlov",
+        "ReactivePlayer",
+        "MemoryOnePlayer",
+        "ZDExtort2",
+        "ZDGenerous2",
+        "ZDEqualizer",
     }
 
     # Human-readable memory requirement for profile scorecards.
@@ -363,6 +435,14 @@ def strategy_scorecard(name: str) -> dict[str, object]:
         "Thief",
         "OneStepBehind",
         "Parrot",
+        "StochasticPavlov",
+        "Appeaser",
+        "Forgiver",
+        "ReactivePlayer",
+        "MemoryOnePlayer",
+        "ZDExtort2",
+        "ZDGenerous2",
+        "ZDEqualizer",
     }:
         memory = 1
     elif nm in {"TitForTwoTats", "TwoTitsForTat"}:
@@ -382,13 +462,15 @@ def strategy_scorecard(name: str) -> dict[str, object]:
         "PatternHunter",
     }:
         memory = "full history"
-    elif nm in {"Gradual", "DebtCollector", "EntropyBroker", "KeepingPeace", "ParkBus", "Illuminati"}:
+    elif nm == "Handshake":
+        memory = 4
+    elif nm in {"Gradual", "DebtCollector", "EntropyBroker", "KeepingPeace", "ParkBus", "Illuminati", "ForgetfulGrudger", "AdaptiveBestResponse", "HedgeMetaStrategy"}:
         memory = "stateful"
     else:
         memory = "unknown"
 
     # Primary tendency (very rough)
-    primary_coop = nm in {"MrNiceGuy", "TitForTat", "WinStayLoseShift", "TitForTwoTats", "TwoTitsForTat", "HardTitForTat", "SoftMajority", "Gradual", "GenerousTitForTat", "Pushover", "KeepingPeace"}
+    primary_coop = nm in {"MrNiceGuy", "TitForTat", "WinStayLoseShift", "TitForTwoTats", "TwoTitsForTat", "HardTitForTat", "SoftMajority", "Gradual", "GenerousTitForTat", "Pushover", "KeepingPeace", "ForgetfulGrudger", "Forgiver", "ZDGenerous2"}
     primary_defect = nm in {"BadCop", "HardMajority", "CalculatedDefector", "HoldingAGrudge", "Thief", "OneStepBehind", "DefectiveDeputy", "BadDivorce", "ParkBus"}
 
     # Uses turn counter / schedule
@@ -437,6 +519,18 @@ def strategy_scorecard(name: str) -> dict[str, object]:
         "DebtCollector",
         "PatternHunter",
         "EntropyBroker",
+        "ForgetfulGrudger",
+        "StochasticPavlov",
+        "Appeaser",
+        "Forgiver",
+        "ReactivePlayer",
+        "MemoryOnePlayer",
+        "ZDExtort2",
+        "ZDGenerous2",
+        "ZDEqualizer",
+        "Handshake",
+        "AdaptiveBestResponse",
+        "HedgeMetaStrategy",
     }
 
     return {

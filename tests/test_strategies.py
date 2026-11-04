@@ -4,9 +4,14 @@ import unittest
 from unittest.mock import patch
 
 from pages.game_logic import (
+    AdaptiveBestResponse,
+    Appeaser,
     DebtCollector,
     EntropyBroker,
+    ForgetfulGrudger,
+    Forgiver,
     Gradual,
+    Handshake,
     HardMajority,
     HardTitForTat,
     PatternHunter,
@@ -27,6 +32,89 @@ from pages.game_logic import (
 
 
 class NewStrategyBehaviorTests(unittest.TestCase):
+    def test_catalog_contains_sixty_unique_strategies(self):
+        names = list_strategy_names()
+        self.assertEqual(len(names), 60)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(
+            {
+                "ForgetfulGrudger",
+                "StochasticPavlov",
+                "Appeaser",
+                "Forgiver",
+                "ReactivePlayer",
+                "MemoryOnePlayer",
+                "ZDExtort2",
+                "ZDGenerous2",
+                "ZDEqualizer",
+                "Handshake",
+                "AdaptiveBestResponse",
+                "HedgeMetaStrategy",
+            }
+            <= set(names)
+        )
+
+    def test_all_twelve_new_strategies_can_play_a_human_match(self):
+        for opponent in (
+            "ForgetfulGrudger",
+            "StochasticPavlov",
+            "Appeaser",
+            "Forgiver",
+            "ReactivePlayer",
+            "MemoryOnePlayer",
+            "ZDExtort2",
+            "ZDGenerous2",
+            "ZDEqualizer",
+            "Handshake",
+            "AdaptiveBestResponse",
+            "HedgeMetaStrategy",
+        ):
+            with self.subTest(opponent=opponent):
+                state = init_human_match_state(opponent=opponent, rounds=2, seed=9)
+                state = step_human_match(state, human_move="cooperate")
+                self.assertIn(state["opponent_history"][-1], {"cooperate", "defect"})
+
+    def test_forgetful_grudger_returns_to_cooperation(self):
+        strategy = ForgetfulGrudger("ForgetfulGrudger", punishment_length=3)
+        histories = [[], ["defect"], ["defect", "cooperate"], ["defect", "cooperate", "cooperate"], ["defect", "cooperate", "cooperate", "cooperate"]]
+        self.assertEqual(
+            [strategy.play(history) for history in histories],
+            ["cooperate", "defect", "defect", "defect", "cooperate"],
+        )
+
+    def test_appeaser_switches_after_defection(self):
+        strategy = Appeaser("Appeaser")
+        self.assertEqual(strategy.play([]), "cooperate")
+        self.assertEqual(strategy.play(["defect"]), "defect")
+        self.assertEqual(strategy.play(["defect", "cooperate"]), "defect")
+        self.assertEqual(strategy.play(["defect", "cooperate", "defect"]), "cooperate")
+
+    def test_forgiver_punishes_once_then_reconciles(self):
+        strategy = Forgiver("Forgiver")
+        histories = [[], ["defect"], ["defect", "defect"], ["defect", "defect", "cooperate"]]
+        self.assertEqual(
+            [strategy.play(history) for history in histories],
+            ["cooperate", "defect", "cooperate", "cooperate"],
+        )
+
+    def test_handshake_recognizes_matching_opening(self):
+        matching = Handshake("Handshake")
+        history = []
+        moves = []
+        for opponent_move in ["cooperate", "defect", "cooperate", "cooperate", "cooperate"]:
+            moves.append(matching.play(history))
+            history.append(opponent_move)
+        self.assertEqual(moves, ["cooperate", "defect", "cooperate", "cooperate", "cooperate"])
+        self.assertEqual(Handshake("Handshake").play(["cooperate", "cooperate", "cooperate", "cooperate"]), "defect")
+
+    def test_adaptive_best_response_updates_conditional_counts(self):
+        strategy = AdaptiveBestResponse("AdaptiveBestResponse")
+        first = strategy.play([])
+        second = strategy.play(["cooperate"])
+        self.assertIn(first, {"cooperate", "defect"})
+        self.assertIn(second, {"cooperate", "defect"})
+        self.assertEqual(strategy.seen, 1)
+
     def test_debt_collector_uses_repayable_trust_ledger(self):
         strategy = DebtCollector("DebtCollector")
         histories = [[], ["defect"], ["defect", "cooperate"], ["defect", "cooperate", "cooperate"]]
@@ -499,6 +587,23 @@ class ValidationTests(unittest.TestCase):
 
 
 class ReproducibilityTests(unittest.TestCase):
+    def test_batch_tournament_can_limit_registered_strategies(self):
+        results = simulate_tournament(
+            strategy_names=["TitForTat", "BadCop", "MrNiceGuy"],
+            rounds_per_match=1,
+            repetitions=1,
+            include_self_play=True,
+        )
+        names = set(results["strategy_1"]) | set(results["strategy_2"])
+        self.assertEqual(names, {"TitForTat", "BadCop", "MrNiceGuy"})
+        self.assertEqual(len(results), 6)
+
+    def test_batch_tournament_validates_selected_strategies(self):
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            simulate_tournament(strategy_names=["TitForTat", "TitForTat"])
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            simulate_tournament(strategy_names=["TitForTat", "Missing"])
+
     def test_execution_error_records_intended_and_executed_moves(self):
         results = simulate_tournament(rounds_per_match=1, repetitions=1, seed=7, execution_error_rate=1.0)
         self.assertTrue((results["intended_move_1"] != results["move_1"]).all())

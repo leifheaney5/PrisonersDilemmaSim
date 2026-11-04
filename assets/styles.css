@@ -11,6 +11,70 @@
   --nav-border: #e5e7eb;
 }
 
+.strategy-landscape-card {
+  overflow: hidden;
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  background:
+    radial-gradient(circle at 12% 5%, rgba(56, 189, 248, 0.16), transparent 36%),
+    radial-gradient(circle at 90% 10%, rgba(139, 92, 246, 0.14), transparent 34%),
+    var(--card-bg);
+  box-shadow: 0 22px 60px rgba(15, 23, 42, 0.12);
+}
+
+.strategy-landscape-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 2rem;
+  padding: 0.45rem 0.45rem 0;
+}
+
+.strategy-landscape-copy {
+  max-width: 760px;
+}
+
+.strategy-landscape-key {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+.strategy-landscape-key span,
+.landscape-axis-note {
+  padding: 0.38rem 0.66rem;
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.58);
+  color: var(--app-text);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.strategy-landscape-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0 1.2rem 0.75rem;
+}
+
+@media (max-width: 768px) {
+  .strategy-landscape-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .strategy-landscape-key {
+    justify-content: flex-start;
+  }
+
+  .strategy-landscape-scale {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 
 /* App shell */
 .app-shell {
@@ -34,6 +98,19 @@
 .app-main {
   flex: 1 1 0;
   min-width: 0;
+}
+
+.app-footer {
+  padding: 1rem;
+  border-top: 1px solid var(--card-border);
+  color: var(--muted-text);
+  text-align: center;
+  font-size: 0.9rem;
+}
+
+.not-found-card {
+  max-width: 760px;
+  margin: clamp(2rem, 8vw, 6rem) auto;
 }
 
 @media (max-width: 992px) {
@@ -216,6 +293,169 @@
   margin: 0.15rem 0 0.2rem;
 }
 
+.insight-panel {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--card-border));
+  border-radius: 16px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 10%, var(--card-bg)), var(--card-bg));
+  box-shadow: 0 12px 34px rgba(15, 23, 42, 0.08);
+}
+
+.insight-panel li + li {
+  margin-top: 0.45rem;
+}
+
+.ranking-explorer {
+  padding: clamp(1rem, 2.5vw, 1.5rem);
+  border: 1px solid rgba(20, 184, 166, 0.3);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 95% 0%, rgba(20, 184, 166, 0.14), transparent 35%),
+    var(--card-bg);
+}
+
+.ranking-explorer-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.ranking-metric-picker {
+  width: min(100%, 280px);
+  min-width: 220px;
+}
+
+.ranking-statement {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  border-left: 4px solid var(--accent-2);
+  border-radius: 0 12px 12px 0;
+  background: rgba(16, 185, 129, 0.09);
+  color: var(--app-text);
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+.match-arena {
+  padding: clamp(1rem, 3vw, 1.75rem);
+  overflow: hidden;
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  border-radius: 20px;
+  background:
+    radial-gradient(circle at 10% 0%, rgba(37, 99, 235, 0.14), transparent 32%),
+    radial-gradient(circle at 90% 0%, rgba(16, 185, 129, 0.14), transparent 32%),
+    var(--card-bg);
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.1);
+}
+
+.arena-round-header,
+.arena-score {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.arena-round-header {
+  margin-bottom: 1rem;
+  padding: 0.65rem 0.9rem;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.06);
+}
+
+.arena-round-label {
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.arena-outcome {
+  text-align: right;
+}
+
+.arena-players {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(0.75rem, 3vw, 2rem);
+}
+
+.arena-player {
+  display: grid;
+  justify-items: center;
+  gap: 0.5rem;
+  padding: 1.25rem;
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--card-bg) 92%, var(--accent));
+  text-align: center;
+}
+
+.arena-player-error {
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}
+
+.arena-player-name {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.arena-move {
+  display: grid;
+  width: clamp(76px, 10vw, 104px);
+  aspect-ratio: 1;
+  place-items: center;
+  border: 4px solid currentColor;
+  font-size: clamp(2.6rem, 7vw, 4.4rem);
+  font-weight: 900;
+  line-height: 1;
+}
+
+.arena-move-cooperate {
+  border-radius: 50%;
+  color: #047857;
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.arena-move-defect {
+  border-radius: 18px;
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.11);
+}
+
+.arena-intention {
+  min-height: 1.25rem;
+  color: var(--muted-text);
+}
+
+.arena-score {
+  width: 100%;
+  margin-top: 0.35rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--card-border);
+}
+
+.arena-versus {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: #0f172a;
+  font-size: 0.8rem;
+  font-weight: 900;
+}
+
+.arena-statement {
+  margin: 1rem 0 0;
+  padding: 0.85rem 1rem;
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.08);
+  line-height: 1.55;
+}
+
 .experiment-advanced {
   margin-bottom: 1rem;
 }
@@ -387,6 +627,30 @@
   color: var(--muted-text);
 }
 
+.matchup-replay-panel {
+  margin-top: 1rem;
+  padding: clamp(1rem, 3vw, 1.5rem);
+  background: #f8fafc;
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+}
+
+.matchup-replay-summary .card {
+  height: 100%;
+}
+
+.evolution-inspector {
+  padding: clamp(1rem, 3vw, 1.5rem);
+  background: #f8fafc;
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+}
+
+.evolution-event-log {
+  max-height: 280px;
+  overflow-y: auto;
+}
+
 /* Scorecard pills */
 .scorecard-grid {
   display: grid;
@@ -527,6 +791,34 @@ textarea:focus {
     align-items: stretch;
     flex-direction: column;
     bottom: 0.35rem;
+  }
+
+  .ranking-explorer-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ranking-metric-picker {
+    width: 100%;
+  }
+
+  .arena-round-header,
+  .arena-score {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .arena-outcome {
+    text-align: left;
+  }
+
+  .arena-players {
+    grid-template-columns: 1fr;
+  }
+
+  .arena-versus {
+    margin: -0.25rem auto;
   }
 
   .experiment-run-actions {

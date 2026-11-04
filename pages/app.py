@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from importlib import import_module
 from pathlib import Path
 import base64
 import json
@@ -16,7 +17,21 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import logging
 import time
-from flask import g, redirect, request
+import uuid
+from flask import g, jsonify, redirect, request
+
+_config_module = import_module(f"{__package__}.config" if __package__ else "config")
+APP_ENV = _config_module.APP_ENV
+COMMIT_SHA = _config_module.COMMIT_SHA
+DEPLOYED_AT = _config_module.DEPLOYED_AT
+PAYPAL_CLIENT_ID = _config_module.PAYPAL_CLIENT_ID
+MAX_REQUEST_BYTES = _config_module.MAX_REQUEST_BYTES
+HEAVY_REQUESTS_PER_MINUTE = _config_module.HEAVY_REQUESTS_PER_MINUTE
+public_runtime_metadata = _config_module.public_runtime_metadata
+
+_security_module = import_module(f"{__package__}.security" if __package__ else "security")
+SlidingWindowLimiter = _security_module.SlidingWindowLimiter
+is_heavy_dash_submission = _security_module.is_heavy_dash_submission
 
 try:
     # When running under gunicorn (Render) as a package import.
@@ -49,11 +64,68 @@ except ImportError:
         strategy_summary,
     )
 
+_robustness_module = import_module(f"{__package__}.robustness" if __package__ else "robustness")
+SeedSweepConfig = _robustness_module.SeedSweepConfig
+run_seed_sweep = _robustness_module.run_seed_sweep
+validate_seed_sweep_result = _robustness_module.validate_seed_sweep_result
+
+_analytics_module = import_module(f"{__package__}.analytics" if __package__ else "analytics")
+perspective_rows = _analytics_module.perspective_rows
+match_level = _analytics_module.match_level
+_tournament_metrics_frame = _analytics_module.tournament_metrics_frame
+_pairwise_metric_frame = _analytics_module.pairwise_metric_frame
+_matchup_replay_frame = _analytics_module.matchup_replay_frame
+_strategy_landscape_frame = _analytics_module.strategy_landscape_frame
+
+_experiment_views_module = import_module(f"{__package__}.experiment_views" if __package__ else "experiment_views")
+_robustness_result_view = _experiment_views_module.robustness_result_view
+_robustness_seed_view = _experiment_views_module.robustness_seed_view
+_evolution_result_view = _experiment_views_module.evolution_result_view
+
+_insights_module = import_module(f"{__package__}.insights" if __package__ else "insights")
+_robustness_insights = _insights_module.robustness_insights
+_evolution_insights = _insights_module.evolution_insights
+
+_rankings_module = import_module(f"{__package__}.rankings" if __package__ else "rankings")
+ROBUSTNESS_METRICS = _rankings_module.ROBUSTNESS_METRICS
+_robustness_ranking_view = _rankings_module.robustness_ranking_view
+_evolution_generation_ranking_view = _rankings_module.evolution_generation_ranking_view
+_tournament_ranking_statement = _rankings_module.tournament_ranking_statement
+
+_match_arena_module = import_module(f"{__package__}.match_arena" if __package__ else "match_arena")
+_build_arena_frames = _match_arena_module.build_arena_frames
+_select_arena_frame = _match_arena_module.select_arena_frame
+
+_version_module = import_module(f"{__package__}.version" if __package__ else "version")
+APP_VERSION = _version_module.APP_VERSION
+GAME_VERSION = _version_module.GAME_VERSION
+ARTIFACT_SCHEMA_VERSIONS = _version_module.ARTIFACT_SCHEMA_VERSIONS
+
 
 try:
     from .strategy_catalog import STRATEGY_PROFILES, strategy_scorecard
 except ImportError:
     from strategy_catalog import STRATEGY_PROFILES, strategy_scorecard  # type: ignore
+try:
+    from .evolution import (
+        EvolutionConfig,
+        build_evolution_result,
+        evolve_moran_population,
+        evolve_population,
+        matchup_statistics,
+        normalize_evolution_config,
+        validate_evolution_result,
+    )
+except ImportError:
+    from evolution import (  # type: ignore
+        EvolutionConfig,
+        build_evolution_result,
+        evolve_moran_population,
+        evolve_population,
+        matchup_statistics,
+        normalize_evolution_config,
+        validate_evolution_result,
+    )
 
 
 # ----------------------------
@@ -71,57 +143,6 @@ def get_results(rounds_per_match: int, repetitions: int, seed: int, horizon_know
     )
 
 
-def perspective_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert ordered (strategy_1/strategy_2) rows into per-player perspective rows:
-    columns: repetition, round, strategy, opponent, move, opp_move, points, opp_points
-    """
-
-    a = df.rename(
-        columns={
-            "strategy_1": "strategy",
-            "strategy_2": "opponent",
-            "move_1": "move",
-            "move_2": "opp_move",
-            "points_1": "points",
-            "points_2": "opp_points",
-        }
-    )[
-        ["repetition", "round", "strategy", "opponent", "move", "opp_move", "points", "opp_points"]
-    ]
-
-    b = df.rename(
-        columns={
-            "strategy_2": "strategy",
-            "strategy_1": "opponent",
-            "move_2": "move",
-            "move_1": "opp_move",
-            "points_2": "points",
-            "points_1": "opp_points",
-        }
-    )[
-        ["repetition", "round", "strategy", "opponent", "move", "opp_move", "points", "opp_points"]
-    ]
-
-    out = pd.concat([a, b], ignore_index=True)
-    out["strategy"] = out["strategy"].astype("string")
-    out["opponent"] = out["opponent"].astype("string")
-    out["move"] = out["move"].astype("string")
-    out["opp_move"] = out["opp_move"].astype("string")
-    return out
-
-
-def match_level(persp: pd.DataFrame) -> pd.DataFrame:
-    m = (
-        persp.groupby(["repetition", "strategy", "opponent"], as_index=False)
-        .agg(points=("points", "sum"), opp_points=("opp_points", "sum"), rounds=("points", "size"))
-    )
-    m["outcome"] = "tie"
-    m.loc[m["points"] > m["opp_points"], "outcome"] = "win"
-    m.loc[m["points"] < m["opp_points"], "outcome"] = "loss"
-    return m
-
-
 # ----------------------------
 # App + layout
 # ----------------------------
@@ -135,10 +156,24 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
     assets_folder=str(_ASSETS_DIR),
     external_stylesheets=[dbc.themes.BOOTSTRAP],
-    external_scripts=[
-        "https://www.paypal.com/sdk/js?client-id=BAAl7kWTxi6DEkHN3OfgGG2D1JqpQdHd22tivmtDGJ574TMPPUoXoCqg0OlGQmeDM2aS4wbzBd0emGM7As&components=hosted-buttons&enable-funding=venmo&currency=USD"
+    meta_tags=[
+        {"name": "viewport", "content": "width=device-width, initial-scale=1"},
+        {
+            "name": "description",
+            "content": "Explore the Iterated Prisoner's Dilemma through live tournaments, custom strategies, robustness analysis, and population evolution.",
+        },
+        {"name": "theme-color", "content": "#ffffff"},
+        {"property": "og:title", "content": "Prisoner's Dilemma Strategy Lab"},
+        {
+            "property": "og:description",
+            "content": "Build strategies, run reproducible tournaments, and explore cooperation through interactive experiments.",
+        },
+        {"property": "og:type", "content": "website"},
+        {
+            "property": "og:image",
+            "content": "https://raw.githubusercontent.com/leifheaney5/PrisonersDilemmaSim/main/assets/logo.png",
+        },
     ],
-    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
 )
 
 app.title = "Prisoner's Dilemma Simulation"
@@ -165,15 +200,84 @@ app.index_string = """<!DOCTYPE html>
 
 # Expose the underlying Flask server for Render/Gunicorn:
 server = app.server
+server.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+_heavy_request_limiter = SlidingWindowLimiter(HEAVY_REQUESTS_PER_MINUTE, 60)
 
 _log = logging.getLogger("pd")
 if not _log.handlers:
     logging.basicConfig(level=logging.INFO)
 
 
+@server.get("/health")
+def health_check():
+    return jsonify({"status": "ok", "app_version": APP_VERSION, "environment": APP_ENV})
+
+
+@server.get("/health/live")
+def liveness_check():
+    """Confirm that the web process can answer requests."""
+    return jsonify({"status": "ok", "service": "web"})
+
+
+@server.get("/health/ready")
+def readiness_check():
+    """Confirm that required local application resources are usable."""
+    checks = {
+        "strategy_catalog": len(list_strategy_names()) == 60,
+        "assets": _ASSETS_DIR.is_dir() and (_ASSETS_DIR / "styles.css").is_file(),
+        "artifact_schemas": bool(ARTIFACT_SCHEMA_VERSIONS),
+    }
+    ready = all(checks.values())
+    return jsonify({"status": "ready" if ready else "not_ready", "checks": checks}), (200 if ready else 503)
+
+
+@server.get("/version")
+def version_info():
+    return jsonify(
+        {
+            "app_version": APP_VERSION,
+            "game_version": GAME_VERSION,
+            "artifact_schema_versions": ARTIFACT_SCHEMA_VERSIONS,
+            **public_runtime_metadata(),
+        }
+    )
+
+
 @server.before_request
 def _pd_start_timer():
     g._pd_start_time = time.perf_counter()
+    supplied_request_id = str(request.headers.get("X-Request-ID", ""))
+    g._pd_request_id = supplied_request_id[:80] if supplied_request_id.isascii() and supplied_request_id else uuid.uuid4().hex
+    payload = request.get_json(silent=True) if request.method == "POST" else None
+    if is_heavy_dash_submission(request.path, request.method, payload):
+        client = request.remote_addr or "unknown"
+        decision = _heavy_request_limiter.check(client)
+        if not decision.allowed:
+            response = jsonify(
+                {
+                    "error": "rate_limit_exceeded",
+                    "message": "Too many heavy experiment requests. Wait before trying again.",
+                    "request_id": g._pd_request_id,
+                }
+            )
+            response.status_code = 429
+            response.headers["Retry-After"] = str(decision.retry_after)
+            return response
+    return None
+
+
+@server.errorhandler(413)
+def request_too_large(_error):
+    return (
+        jsonify(
+            {
+                "error": "request_too_large",
+                "message": f"Request body exceeds the {MAX_REQUEST_BYTES}-byte limit.",
+                "request_id": getattr(g, "_pd_request_id", "unknown"),
+            }
+        ),
+        413,
+    )
 
 
 @server.after_request
@@ -184,14 +288,48 @@ def _pd_log_slow_requests(resp):
     ms = (time.perf_counter() - float(start)) * 1000.0
     # Useful for quick triage in Render without adding a full profiler.
     resp.headers["X-Response-Time-ms"] = f"{ms:.1f}"
+    resp.headers["X-Request-ID"] = str(getattr(g, "_pd_request_id", "unknown"))
     try:
         clen = resp.calculate_content_length()
     except Exception:
         clen = None
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(self)")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.paypal.com https://www.paypalobjects.com; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob: https://www.paypalobjects.com https://*.paypal.com https://raw.githubusercontent.com; "
+        "connect-src 'self' https://*.paypal.com; "
+        "frame-src https://*.paypal.com; "
+        "font-src 'self' data: https://cdn.jsdelivr.net; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+    )
+    if request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https":
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if request.path.startswith("/_dash-update-component") and ms >= 800:
-        _log.info("SLOW dash update: %s %s ms=%.1f bytes=%s", request.method, request.path, ms, clen)
+        _log.info(
+            "SLOW dash update request_id=%s method=%s path=%s status=%s ms=%.1f bytes=%s",
+            getattr(g, "_pd_request_id", "unknown"),
+            request.method,
+            request.path,
+            resp.status_code,
+            ms,
+            clen,
+        )
     elif ms >= 2000:
-        _log.info("SLOW request: %s %s ms=%.1f bytes=%s", request.method, request.path, ms, clen)
+        _log.info(
+            "SLOW request request_id=%s method=%s path=%s status=%s ms=%.1f bytes=%s",
+            getattr(g, "_pd_request_id", "unknown"),
+            request.method,
+            request.path,
+            resp.status_code,
+            ms,
+            clen,
+        )
     return resp
 
 
@@ -225,53 +363,6 @@ def navbar_links() -> list[dbc.NavLink]:
 pio.templates.default = "plotly_white"
 
 GRAPH_CONFIG = {"displayModeBar": False, "responsive": True}
-def _tournament_metrics_frame(state: dict) -> pd.DataFrame:
-    """Return comparable live metrics without favoring strategies that played first."""
-    rows = []
-    for strategy in state.get("strategy_names", []) or []:
-        rounds = int((state.get("rounds_played", {}) or {}).get(strategy, 0))
-        points = int((state.get("totals", {}) or {}).get(strategy, 0))
-        cooperations = int((state.get("cooperate", {}) or {}).get(strategy, 0))
-        wins = int((state.get("match_wins", {}) or {}).get(strategy, 0))
-        losses = int((state.get("match_losses", {}) or {}).get(strategy, 0))
-        ties = int((state.get("match_ties", {}) or {}).get(strategy, 0))
-        matches = wins + losses + ties
-        rows.append(
-            {
-                "strategy": strategy,
-                "total_points": points,
-                "points_per_round": points / rounds if rounds else 0.0,
-                "cooperation_rate": cooperations / rounds if rounds else 0.0,
-                "defection_rate": (rounds - cooperations) / rounds if rounds else 0.0,
-                "win_rate": wins / matches if matches else 0.0,
-                "rounds_played": rounds,
-                "matches_played": matches,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def _pairwise_metric_frame(results: pd.DataFrame, metric: str) -> pd.DataFrame:
-    """Build a strategy-by-opponent matrix for a selected matchup metric."""
-    persp = perspective_rows(results)
-    if persp.empty:
-        return pd.DataFrame()
-    grouped = persp.groupby(["strategy", "opponent"], as_index=False).agg(
-        points_per_round=("points", "mean"),
-        opponent_points_per_round=("opp_points", "mean"),
-        cooperation_rate=("move", lambda moves: float((moves == "cooperate").mean())),
-    )
-    grouped["score_margin"] = grouped["points_per_round"] - grouped["opponent_points_per_round"]
-    if metric == "win_rate":
-        matches = match_level(persp)
-        win_rates = matches.groupby(["strategy", "opponent"], as_index=False).agg(
-            win_rate=("outcome", lambda outcomes: float((outcomes == "win").mean()))
-        )
-        grouped = grouped.merge(win_rates, on=["strategy", "opponent"], how="left")
-    value = metric if metric in {"points_per_round", "cooperation_rate", "score_margin", "win_rate"} else "points_per_round"
-    return grouped.pivot(index="strategy", columns="opponent", values=value)
-
-
 def _custom_preview_rows(config: dict, opponent_moves: list[str], seed: int = 0) -> list[dict]:
     """Evaluate an unsaved custom policy against a deterministic scripted opponent."""
     name = "__preview__"
@@ -410,6 +501,27 @@ app.layout = html.Div(
                 html.Br(),
             ],
             fluid=True,
+        ),
+        html.Footer(
+            [
+                html.Span("Prisoner's Dilemma Strategy Lab"),
+                html.Span(" · "),
+                html.A(f"Version {APP_VERSION}", href="/version", target="_blank"),
+                html.Span(" · "),
+                html.A(
+                    "Privacy",
+                    href="https://github.com/leifheaney5/PrisonersDilemmaSim/blob/main/PRIVACY.md",
+                    target="_blank",
+                ),
+                html.Span(" · "),
+                html.A(
+                    "Security",
+                    href="https://github.com/leifheaney5/PrisonersDilemmaSim/blob/main/SECURITY.md",
+                    target="_blank",
+                ),
+            ],
+            id="app-footer",
+            className="app-footer",
         ),
     ],
 )
@@ -987,10 +1099,15 @@ def donate_page() -> html.Div:
                                 html.Div(
                                     id="paypal-container-YCXC33LAEKQ78",
                                     style={"minHeight": "60px"},
+                                    **{"data-paypal-client-id": PAYPAL_CLIENT_ID},
                                 )
                             ]
                         ),
                         html.Hr(),
+                        html.P(
+                            "The PayPal payment script loads only on this page. PayPal processes payment information under its own privacy policy.",
+                            className="muted small",
+                        ),
                         html.P(
                             "Thank you. Your support helps cover maintenance and future development.",
                             className="muted",
@@ -1171,6 +1288,45 @@ def profiles_page() -> html.Div:
     names = list_strategy_names()
     return html.Div(
         [
+            dbc.Card(
+                dbc.CardBody(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Small("INTERACTIVE MAP", className="section-kicker"),
+                                        html.H2("Strategy landscape", className="mb-2"),
+                                        html.P(
+                                            "See all 60 strategies at once. Select a point to open its profile and compare how strongly it responds to cooperation, how stable its actions are, and how efficiently it scores.",
+                                            className="muted mb-0",
+                                        ),
+                                    ],
+                                    className="strategy-landscape-copy",
+                                ),
+                                html.Div(
+                                    [
+                                        html.Span("Color: cooperation rate"),
+                                        html.Span("Size: points per round"),
+                                        html.Span("Shape: deterministic or stochastic"),
+                                    ],
+                                    className="strategy-landscape-key",
+                                ),
+                            ],
+                            className="strategy-landscape-header",
+                        ),
+                        dcc.Graph(id="strategy-landscape", config=GRAPH_CONFIG),
+                        html.Div(
+                            [
+                                html.Span("Defensive response", className="landscape-axis-note"),
+                                html.Span("Responsive reciprocity", className="landscape-axis-note"),
+                            ],
+                            className="strategy-landscape-scale",
+                        ),
+                    ]
+                ),
+                className="strategy-landscape-card mb-4",
+            ),
             html.H3("Profile Overview"),
             html.P("Pick a strategy to see what it does and how it performs in the current simulation settings."),
             dcc.Download(id="profile-download"),
@@ -1265,6 +1421,11 @@ def profiles_page() -> html.Div:
                                 {"label": "Cooperation rate", "value": "cooperation_rate"},
                                 {"label": "Score margin", "value": "score_margin"},
                                 {"label": "Win rate", "value": "win_rate"},
+                                {"label": "Combined payoff", "value": "combined_payoff"},
+                                {"label": "Payoff inequality", "value": "payoff_inequality"},
+                                {"label": "Mutual cooperation rate", "value": "mutual_cooperation_rate"},
+                                {"label": "Mutual defection rate", "value": "mutual_defection_rate"},
+                                {"label": "Exploitation rate", "value": "exploitation_rate"},
                             ],
                             value="points_per_round",
                             clearable=False,
@@ -1274,7 +1435,61 @@ def profiles_page() -> html.Div:
                 ),
                 className="mb-2",
             ),
+            dbc.Alert(
+                "These metrics analyze the same classic payoff matrix. They do not change the game rules.",
+                color="info",
+                className="py-2",
+            ),
             dcc.Graph(id="matchup-matrix", config=GRAPH_CONFIG),
+            html.Div(
+                [
+                    html.H4("Matchup replay"),
+                    html.P("Select a matrix cell to inspect one repetition round by round.", className="muted"),
+                    dbc.Row(
+                        dbc.Col(
+                            [
+                                dbc.Label("Repetition"),
+                                dcc.Dropdown(
+                                    id="matchup-replay-repetition",
+                                    options=[{"label": str(index + 1), "value": index} for index in range(30)],
+                                    value=0,
+                                    clearable=False,
+                                ),
+                            ],
+                            md=3,
+                        ),
+                        className="mb-2",
+                    ),
+                    html.Div(id="matchup-replay-summary", className="matchup-replay-summary"),
+                    dcc.Store(id="matchup-arena-frames"),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Span("MATCH ARENA", className="section-kicker"),
+                                    html.H4("Step through the decisions"),
+                                    html.P(
+                                        "Move the round control to reveal actions, payoffs, execution errors, and the running score.",
+                                        className="muted mb-0",
+                                    ),
+                                ],
+                                className="mb-3",
+                            ),
+                            dcc.Slider(id="matchup-arena-round", min=1, max=1, step=1, value=1, marks={1: "1"}),
+                            html.Div(id="matchup-arena-frame", className="match-arena-frame mt-3"),
+                        ],
+                        className="match-arena mb-4",
+                    ),
+                    dcc.Graph(id="matchup-replay-figure", config=GRAPH_CONFIG),
+                    dash_table.DataTable(
+                        id="matchup-replay-table",
+                        page_size=12,
+                        style_table={"overflowX": "auto"},
+                        style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                    ),
+                ],
+                className="matchup-replay-panel",
+            ),
             html.Hr(),
             html.H3("Compare two strategies"),
             html.P("Compare head-to-head results and behaviors side-by-side.", className="muted"),
@@ -1363,6 +1578,8 @@ def experiment_page() -> html.Div:
                         dcc.Interval(id="tournament-interval", interval=650, disabled=True),
                         dcc.Store(id="human-match-state"),
                         dcc.Store(id="custom-strategies", data=[]),
+                        dcc.Store(id="evolution-result"),
+                        dcc.Store(id="robustness-result"),
                         dcc.Download(id="experiment-config-download"),
                         html.Div(
                             [
@@ -1588,6 +1805,12 @@ def experiment_page() -> html.Div:
                                                 dbc.Col(dcc.Graph(id="tournament-leaderboard", config=GRAPH_CONFIG), md=6),
                                                 dbc.Col(dcc.Graph(id="tournament-points-timeline", config=GRAPH_CONFIG), md=6),
                                             ]
+                                        ),
+                                        html.P(
+                                            id="tournament-ranking-statement",
+                                            className="ranking-statement",
+                                            role="status",
+                                            **{"aria-live": "polite"},
                                         ),
                                         html.Br(),
                                         dbc.Row(
@@ -1984,6 +2207,347 @@ def experiment_page() -> html.Div:
                                         ),
                                     ],
                                 ),
+                                dbc.Tab(
+                                    label="Robustness",
+                                    tab_id="tab-robustness",
+                                    children=[
+                                        html.Br(),
+                                        dbc.Alert(
+                                            [
+                                                html.Strong("Experimental analysis. "),
+                                                "Each seed runs an independent tournament using the selected Prisoner’s Dilemma format. The sweep measures result stability; it does not change strategy rules.",
+                                            ],
+                                            color="warning",
+                                        ),
+                                        html.Div(
+                                            [
+                                                html.Span("ROBUSTNESS", className="section-kicker"),
+                                                html.H4("Test results across seeds"),
+                                                html.P("Compare typical performance with volatility instead of relying on one random seed.", className="muted mb-0"),
+                                            ],
+                                            className="lab-section-heading",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Strategies"),
+                                                        dcc.Dropdown(
+                                                            id="robustness-strategies",
+                                                            options=[{"label": name, "value": name} for name in names],
+                                                            value=["TitForTat", "GenerousTitForTat", "BadCop", "ImSoRandom"],
+                                                            multi=True,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col([dbc.Label("Starting seed"), dbc.Input(id="robustness-start-seed", type="number", value=0)], md=2),
+                                                dbc.Col([dbc.Label("Number of seeds"), dbc.Input(id="robustness-seed-count", type="number", min=1, max=100, value=10)], md=2),
+                                                dbc.Col([dbc.Label("Seed step"), dbc.Input(id="robustness-seed-step", type="number", value=1)], md=2),
+                                            ],
+                                            className="g-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col([dbc.Label("Rounds per match"), dbc.Input(id="robustness-rounds", type="number", min=1, max=1000, value=50)], md=2),
+                                                dbc.Col([dbc.Label("Repetitions per seed"), dbc.Input(id="robustness-repetitions", type="number", min=1, max=100, value=3)], md=2),
+                                                dbc.Col([dbc.Label("Execution error probability"), dbc.Input(id="robustness-error-rate", type="number", min=0, max=1, step=0.01, value=0)], md=3),
+                                                dbc.Col(dbc.Switch(id="robustness-self-play", label="Include self-play", value=False), md=2),
+                                                dbc.Col(dbc.Switch(id="robustness-horizon-known", label="Match length is known", value=False), md=3),
+                                            ],
+                                            className="g-3 mt-2 align-items-end",
+                                        ),
+                                        html.Div(
+                                            [
+                                                dbc.Button("Run seed sweep", id="robustness-run", color="primary"),
+                                                dbc.Button("Reset result", id="robustness-reset", color="danger", outline=True),
+                                                dbc.Button("Export result", id="robustness-export", color="secondary", outline=True),
+                                                dcc.Upload(
+                                                    dbc.Button("Open result", color="secondary", outline=True),
+                                                    id="robustness-import",
+                                                    accept="application/json,.json",
+                                                    multiple=False,
+                                                ),
+                                                dcc.Download(id="robustness-download"),
+                                            ],
+                                            className="btn-row mt-3",
+                                        ),
+                                        html.Div(id="robustness-status", className="mt-2"),
+                                        html.Div(id="robustness-transfer-status", className="muted mt-2"),
+                                        html.Div(id="robustness-insights", className="mt-3"),
+                                        html.Div(
+                                            [
+                                                html.Div(
+                                                    [
+                                                        html.Div(
+                                                            [
+                                                                html.Span("INTERACTIVE RANKING", className="section-kicker"),
+                                                                html.H4("Explore the result order"),
+                                                                html.P(
+                                                                    "Change the metric, then select a bar for a deterministic performance statement.",
+                                                                    className="muted mb-0",
+                                                                ),
+                                                            ]
+                                                        ),
+                                                        dcc.Dropdown(
+                                                            id="robustness-ranking-metric",
+                                                            options=[
+                                                                {"label": definition["label"], "value": metric}
+                                                                for metric, definition in ROBUSTNESS_METRICS.items()
+                                                            ],
+                                                            value="mean_payoff",
+                                                            clearable=False,
+                                                            className="ranking-metric-picker",
+                                                        ),
+                                                    ],
+                                                    className="ranking-explorer-header",
+                                                ),
+                                                dcc.Graph(id="robustness-ranking-chart", config=GRAPH_CONFIG),
+                                                html.P(
+                                                    id="robustness-ranking-statement",
+                                                    className="ranking-statement",
+                                                    role="status",
+                                                    **{"aria-live": "polite"},
+                                                ),
+                                            ],
+                                            className="ranking-explorer mt-3",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="robustness-payoff-chart", config=GRAPH_CONFIG), md=6),
+                                                dbc.Col(dcc.Graph(id="robustness-rank-chart", config=GRAPH_CONFIG), md=6),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        dash_table.DataTable(
+                                            id="robustness-summary-table",
+                                            sort_action="native",
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={"fontFamily": "system-ui", "fontSize": 12, "padding": "7px"},
+                                        ),
+                                        html.Hr(),
+                                        html.Div(
+                                            [
+                                                html.H4("Seed inspector"),
+                                                html.P("Inspect one independent tournament without rerunning the sweep.", className="muted"),
+                                                dcc.Dropdown(id="robustness-seed-inspector", clearable=False),
+                                                dbc.Row(
+                                                    [
+                                                        dbc.Col(dcc.Graph(id="robustness-seed-payoff-chart", config=GRAPH_CONFIG), md=6),
+                                                        dbc.Col(dcc.Graph(id="robustness-seed-cooperation-chart", config=GRAPH_CONFIG), md=6),
+                                                    ],
+                                                    className="g-3",
+                                                ),
+                                                dash_table.DataTable(
+                                                    id="robustness-seed-table",
+                                                    sort_action="native",
+                                                    style_table={"overflowX": "auto"},
+                                                    style_cell={"fontFamily": "system-ui", "fontSize": 12, "padding": "7px"},
+                                                ),
+                                            ],
+                                            className="evolution-inspector",
+                                        ),
+                                    ],
+                                ),
+                                dbc.Tab(
+                                    label="Evolution",
+                                    tab_id="tab-evolution",
+                                    children=[
+                                        html.Br(),
+                                        dbc.Alert(
+                                            [
+                                                html.Strong("Experimental extension. "),
+                                                "Population shares change between generations. Individual matches still use the classic Prisoner’s Dilemma actions and payoff matrix.",
+                                            ],
+                                            color="warning",
+                                        ),
+                                        html.Div(
+                                            [html.Span("EVOLUTION", className="section-kicker"), html.H4("Population experiment"), html.P("Start with equal strategy shares and track how relative payoff changes the population.", className="muted mb-0")],
+                                            className="lab-section-heading",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Strategies"),
+                                                        dcc.Dropdown(
+                                                            id="evolution-strategies",
+                                                            options=[{"label": name, "value": name} for name in names],
+                                                            value=["TitForTat", "Gradual", "BadCop", "MrNiceGuy"],
+                                                            multi=True,
+                                                        ),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col([dbc.Label("Generations"), dbc.Input(id="evolution-generations", type="number", min=1, max=500, value=100)], md=2),
+                                                dbc.Col([dbc.Label("Rounds per matchup"), dbc.Input(id="evolution-rounds", type="number", min=1, max=100, value=20)], md=2),
+                                                dbc.Col([dbc.Label("Seed"), dbc.Input(id="evolution-seed", type="number", value=0)], md=2),
+                                            ],
+                                            className="g-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Population preset"),
+                                                        dcc.Dropdown(
+                                                            id="evolution-preset",
+                                                            options=[
+                                                                {"label": "Equal shares", "value": "equal"},
+                                                                {"label": "First strategy at 99%, second at 1%", "value": "invasion"},
+                                                                {"label": "Random shares", "value": "random"},
+                                                            ],
+                                                            value="equal",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                                dbc.Col(
+                                                    dash_table.DataTable(
+                                                        id="evolution-population-table",
+                                                        columns=[
+                                                            {"name": "Strategy", "id": "strategy", "editable": False},
+                                                            {"name": "Starting share", "id": "share", "type": "numeric", "editable": True},
+                                                        ],
+                                                        data=[{"strategy": name, "share": 0.25} for name in ["TitForTat", "Gradual", "BadCop", "MrNiceGuy"]],
+                                                        editable=True,
+                                                        style_table={"overflowX": "auto"},
+                                                        style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                                                    ),
+                                                    md=8,
+                                                ),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Population model"),
+                                                        dcc.Dropdown(
+                                                            id="evolution-model",
+                                                            options=[
+                                                                {"label": "Deterministic replicator dynamics", "value": "replicator"},
+                                                                {"label": "Finite-population Moran process", "value": "moran"},
+                                                            ],
+                                                            value="replicator",
+                                                            clearable=False,
+                                                        ),
+                                                    ],
+                                                    md=4,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Finite population size"),
+                                                        dbc.Input(id="evolution-population-size", type="number", min=10, max=10000, value=100, disabled=True),
+                                                        html.Small("Used only by the Moran process", className="muted"),
+                                                    ],
+                                                    md=2,
+                                                ),
+                                                dbc.Col([dbc.Label("Match repetitions"), dbc.Input(id="evolution-repetitions", type="number", min=1, max=30, value=3)], md=2),
+                                                dbc.Col([dbc.Label("Execution error probability"), dbc.Input(id="evolution-error-rate", type="number", min=0, max=1, step=0.01, value=0)], md=4),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Match information"),
+                                                        dbc.Switch(id="evolution-horizon-known", label="Strategies know the number of rounds", value=False),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Selection strength"),
+                                                        dcc.Slider(id="evolution-selection", min=0, max=1, step=0.05, value=1, marks={0: "None", 0.5: "0.5", 1: "Full"}),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                                dbc.Col(
+                                                    [
+                                                        dbc.Label("Mutation rate"),
+                                                        dcc.Slider(id="evolution-mutation", min=0, max=0.25, step=0.01, value=0, marks={0: "0%", 0.1: "10%", 0.25: "25%"}),
+                                                    ],
+                                                    md=6,
+                                                ),
+                                            ],
+                                            className="g-3 mt-2",
+                                        ),
+                                        html.Div(
+                                            [
+                                                dbc.Button("Run evolution", id="evolution-run", color="primary"),
+                                                dbc.Button("Reset result", id="evolution-reset", color="danger", outline=True),
+                                                dbc.Button("Export settings", id="evolution-export", color="secondary", outline=True),
+                                                dcc.Upload(
+                                                    dbc.Button("Import settings", color="secondary", outline=True),
+                                                    id="evolution-import",
+                                                    accept="application/json,.json",
+                                                    multiple=False,
+                                                ),
+                                                dcc.Download(id="evolution-config-download"),
+                                                dbc.Button("Export result", id="evolution-result-export", color="secondary", outline=True),
+                                                dcc.Upload(
+                                                    dbc.Button("Open result", color="secondary", outline=True),
+                                                    id="evolution-result-import",
+                                                    accept="application/json,.json",
+                                                    multiple=False,
+                                                ),
+                                                dcc.Download(id="evolution-result-download"),
+                                            ],
+                                            className="btn-row mt-3",
+                                        ),
+                                        html.Div(id="evolution-transfer-status", className="muted mt-2"),
+                                        html.Div(id="evolution-result-transfer-status", className="muted mt-2"),
+                                        html.Div(id="evolution-status", className="mt-2"),
+                                        html.Div(id="evolution-insights", className="mt-3"),
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(dcc.Graph(id="evolution-population-chart", config=GRAPH_CONFIG), md=12),
+                                                dbc.Col(dcc.Graph(id="evolution-outcomes-chart", config=GRAPH_CONFIG), md=12),
+                                            ],
+                                            className="g-3",
+                                        ),
+                                        dash_table.DataTable(
+                                            id="evolution-final-table",
+                                            sort_action="native",
+                                            style_table={"overflowX": "auto"},
+                                            style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                                        ),
+                                        html.Hr(),
+                                        html.Div(
+                                            [
+                                                html.H4("Generation inspector"),
+                                                html.P("Select a completed generation. Changing this control does not rerun the experiment.", className="muted"),
+                                                dcc.Slider(id="evolution-generation", min=0, max=1, step=1, value=0, marks={0: "0"}),
+                                                html.Div(id="evolution-generation-summary", className="mt-3"),
+                                                dcc.Graph(id="evolution-generation-ranking", config=GRAPH_CONFIG),
+                                                html.P(
+                                                    id="evolution-generation-ranking-statement",
+                                                    className="ranking-statement",
+                                                    role="status",
+                                                    **{"aria-live": "polite"},
+                                                ),
+                                                dash_table.DataTable(
+                                                    id="evolution-generation-table",
+                                                    sort_action="native",
+                                                    style_table={"overflowX": "auto"},
+                                                    style_cell={"fontFamily": "system-ui", "fontSize": 13, "padding": "7px"},
+                                                ),
+                                                html.H4("Event log", className="mt-4"),
+                                                html.Div(id="evolution-event-log", className="evolution-event-log"),
+                                            ],
+                                            className="evolution-inspector",
+                                        ),
+                                    ],
+                                ),
                             ],
                             id="experiment-mode-tabs",
                             active_tab="tab-tournament",
@@ -2002,6 +2566,30 @@ def experiment_page() -> html.Div:
 # ----------------------------
 
 
+def not_found_page(pathname: str) -> html.Div:
+    return html.Div(
+        dbc.Card(
+            dbc.CardBody(
+                [
+                    html.Div("404", className="section-kicker"),
+                    html.H2("Page not found"),
+                    html.P(f"There is no page at {pathname}.", className="muted"),
+                    html.Div(
+                        [
+                            dbc.Button("Go to Overview", href="/", color="primary"),
+                            dbc.Button("Open Learn", href="/learn", color="secondary", outline=True),
+                            dbc.Button("Open Experiment", href="/experiment", color="secondary", outline=True),
+                            dbc.Button("Open Profiles", href="/profiles", color="secondary", outline=True),
+                        ],
+                        className="btn-row",
+                    ),
+                ]
+            ),
+            className="glass-card not-found-card",
+        )
+    )
+
+
 @callback(
     Output("page-content", "children"),
     Input("url", "pathname"),
@@ -2018,8 +2606,9 @@ def display_page(pathname: str):
         return html.Div([dcc.Location(id="redirect-explore", href="/experiment")])
     if pathname == "/donate":
         return donate_page()
-    # default: about/overview
-    return about_page()
+    if pathname in {"/", "", None}:
+        return about_page()
+    return not_found_page(str(pathname))
 
 
 @callback(
@@ -2049,6 +2638,83 @@ def update_payoff_lesson(player_move: str, opponent_move: str):
 
 
 @callback(
+    Output("strategy-landscape", "figure"),
+    Input("sim-settings", "data"),
+)
+def update_strategy_landscape(sim_settings: dict):
+    settings = dict(sim_settings or {})
+    results = get_results(
+        int(settings.get("rounds_per_match", 10) or 10),
+        int(settings.get("repetitions", 10) or 10),
+        int(settings.get("seed", 0) or 0),
+        bool(settings.get("horizon_known", True)),
+    )
+    landscape = _strategy_landscape_frame(results)
+    if landscape.empty:
+        return px.scatter(title="No strategy landscape data available")
+    landscape["policy_type"] = landscape["strategy"].map(
+        lambda name: "Deterministic" if strategy_scorecard(name)["deterministic"] else "Stochastic"
+    )
+    figure = px.scatter(
+        landscape,
+        x="response_gap",
+        y="stability",
+        color="cooperation_rate",
+        size="points_per_round",
+        symbol="policy_type",
+        hover_name="strategy",
+        custom_data=["strategy"],
+        color_continuous_scale=[
+            (0, "#440154"),
+            (0.35, "#31688e"),
+            (0.7, "#35b779"),
+            (1, "#fde725"),
+        ],
+        range_color=[0, 1],
+        size_max=30,
+        labels={
+            "response_gap": "Response gap",
+            "stability": "Action stability",
+            "cooperation_rate": "Cooperation rate",
+            "points_per_round": "Points per round",
+            "policy_type": "Policy type",
+        },
+    )
+    figure.add_vline(x=0, line_width=1, line_dash="dot", line_color="rgba(100,116,139,.65)")
+    figure.add_hline(y=0.5, line_width=1, line_dash="dot", line_color="rgba(100,116,139,.65)")
+    figure.add_annotation(x=0.82, y=0.94, text="Stable reciprocators", showarrow=False)
+    figure.add_annotation(x=-0.45, y=0.94, text="Stable defenders", showarrow=False)
+    figure.add_annotation(x=0.82, y=0.08, text="Reactive switchers", showarrow=False)
+    figure.update_traces(marker={"line": {"width": 1.2, "color": "rgba(15,23,42,.6)"}})
+    figure.update_layout(
+        height=620,
+        margin=dict(l=20, r=20, t=25, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15,23,42,.035)",
+        hovermode="closest",
+        transition={"duration": 350, "easing": "cubic-in-out"},
+        xaxis={"range": [-1.05, 1.05], "tickformat": ".0%", "gridcolor": "rgba(148,163,184,.18)"},
+        yaxis={"range": [-0.03, 1.03], "tickformat": ".0%", "gridcolor": "rgba(148,163,184,.18)"},
+        legend={"orientation": "h", "y": 1.08, "x": 0},
+    )
+    return figure
+
+
+@callback(
+    Output("profile-strategy", "value"),
+    Input("strategy-landscape", "clickData"),
+    prevent_initial_call=True,
+)
+def select_landscape_strategy(click_data):
+    if not click_data or not click_data.get("points"):
+        return dash.no_update
+    point = click_data["points"][0]
+    custom_data = point.get("customdata") or []
+    strategy = str(custom_data[0]) if custom_data else str(point.get("hovertext", ""))
+    return strategy if strategy in set(list_strategy_names()) else dash.no_update
+
+
+@callback(
     Output("matchup-matrix", "figure"),
     Input("matchup-matrix-metric", "value"),
     Input("sim-settings", "data"),
@@ -2067,6 +2733,11 @@ def update_matchup_matrix(metric: str, sim_settings: dict):
         "cooperation_rate": "Cooperation rate",
         "score_margin": "Score margin",
         "win_rate": "Win rate",
+        "combined_payoff": "Combined payoff",
+        "payoff_inequality": "Payoff inequality",
+        "mutual_cooperation_rate": "Mutual cooperation rate",
+        "mutual_defection_rate": "Mutual defection rate",
+        "exploitation_rate": "Exploitation rate",
     }
     selected = metric if metric in labels else "points_per_round"
     if matrix.empty:
@@ -2077,7 +2748,12 @@ def update_matchup_matrix(metric: str, sim_settings: dict):
         color_range = [-bound, bound]
     else:
         color_scale = "Viridis"
-        color_range = [0, 5] if selected == "points_per_round" else [0, 1]
+        if selected == "combined_payoff":
+            color_range = [0, 6]
+        elif selected in {"points_per_round", "payoff_inequality"}:
+            color_range = [0, 5]
+        else:
+            color_range = [0, 1]
     figure = px.imshow(
         matrix,
         color_continuous_scale=color_scale,
@@ -2089,6 +2765,169 @@ def update_matchup_matrix(metric: str, sim_settings: dict):
     )
     figure.update_layout(height=760, margin=dict(l=10, r=10, t=60, b=10))
     return figure
+
+
+@callback(
+    Output("matchup-replay-summary", "children"),
+    Output("matchup-replay-figure", "figure"),
+    Output("matchup-replay-table", "columns"),
+    Output("matchup-replay-table", "data"),
+    Output("matchup-arena-frames", "data"),
+    Input("matchup-matrix", "clickData"),
+    Input("matchup-replay-repetition", "value"),
+    Input("sim-settings", "data"),
+)
+def update_matchup_replay(click_data, repetition: int, sim_settings: dict):
+    if not click_data or not click_data.get("points"):
+        return "Select a cell in the matrix.", go.Figure(), [], [], []
+    point = click_data["points"][0]
+    strategy = str(point.get("y", ""))
+    opponent = str(point.get("x", ""))
+    settings = dict(sim_settings or {})
+    results = get_results(
+        int(settings.get("rounds_per_match", 10) or 10),
+        int(settings.get("repetitions", 10) or 10),
+        int(settings.get("seed", 0) or 0),
+        bool(settings.get("horizon_known", True)),
+    )
+    replay = _matchup_replay_frame(results, strategy, opponent, int(repetition or 0))
+    if replay.empty:
+        return f"No data for repetition {int(repetition or 0) + 1}.", go.Figure(), [], [], []
+
+    rounds = replay["round"].tolist()
+    action_values = [
+        [0 if move == "cooperate" else 1 for move in replay["strategy_move"]],
+        [0 if move == "cooperate" else 1 for move in replay["opponent_move"]],
+    ]
+    action_text = [["C" if value == 0 else "D" for value in row] for row in action_values]
+    figure = make_subplots(rows=2, cols=1, row_heights=[0.34, 0.66], vertical_spacing=0.16)
+    figure.add_trace(
+        go.Heatmap(
+            x=rounds,
+            y=[strategy, opponent],
+            z=action_values,
+            text=action_text,
+            texttemplate="%{text}",
+            colorscale=[[0, "#2ca02c"], [0.499, "#2ca02c"], [0.5, "#d62728"], [1, "#d62728"]],
+            showscale=False,
+            hovertemplate="Round %{x}<br>%{y}: %{text}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(x=rounds, y=replay["cumulative_strategy"], name=strategy, mode="lines+markers"),
+        row=2,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(x=rounds, y=replay["cumulative_opponent"], name=opponent, mode="lines+markers"),
+        row=2,
+        col=1,
+    )
+    figure.update_layout(
+        title=f"{strategy} vs {opponent}, repetition {int(repetition or 0) + 1}",
+        height=560,
+        margin=dict(l=10, r=10, t=60, b=30),
+        hovermode="x unified",
+    )
+    figure.update_xaxes(title_text="Round", row=2, col=1)
+    figure.update_yaxes(title_text="Cumulative points", row=2, col=1)
+
+    mutual_cooperation = float((replay["outcome"] == "mutual cooperation").mean())
+    mutual_defection = float((replay["outcome"] == "mutual defection").mean())
+    exploitation = float((replay["strategy_move"] != replay["opponent_move"]).mean())
+    summary = dbc.Row(
+        [
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Combined payoff"), html.H4(f"{replay['combined_payoff'].mean():.2f}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Mutual cooperation"), html.H4(f"{mutual_cooperation:.0%}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Mutual defection"), html.H4(f"{mutual_defection:.0%}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Exploitation"), html.H4(f"{exploitation:.0%}")])), md=3),
+        ],
+        className="g-2 mb-2",
+    )
+    table = replay.copy()
+    for column in ("strategy_move", "opponent_move", "strategy_intended", "opponent_intended"):
+        table[column] = table[column].map({"cooperate": "C", "defect": "D"})
+    visible = [
+        "round",
+        "strategy_move",
+        "opponent_move",
+        "strategy_points",
+        "opponent_points",
+        "combined_payoff",
+        "outcome",
+    ]
+    table = table[visible]
+    columns = [{"name": column.replace("_", " ").title(), "id": column} for column in visible]
+    frames = _build_arena_frames(replay.to_dict("records"), strategy, opponent)
+    return summary, figure, columns, table.to_dict("records"), frames
+
+
+@callback(
+    Output("matchup-arena-round", "max"),
+    Output("matchup-arena-round", "marks"),
+    Output("matchup-arena-round", "value"),
+    Input("matchup-arena-frames", "data"),
+)
+def configure_match_arena(frames):
+    count = len(frames) if isinstance(frames, list) else 0
+    if not count:
+        return 1, {1: "1"}, 1
+    step = max(1, count // 5)
+    marks = {value: str(value) for value in range(1, count + 1, step)}
+    marks[count] = str(count)
+    return count, marks, 1
+
+
+@callback(
+    Output("matchup-arena-frame", "children"),
+    Input("matchup-arena-frames", "data"),
+    Input("matchup-arena-round", "value"),
+)
+def render_match_arena(frames, round_number):
+    frame = _select_arena_frame(frames, round_number)
+    if frame is None:
+        return html.P("Select a matchup matrix cell to open the Match Arena.", className="muted mb-0")
+
+    def player_card(prefix):
+        name = str(frame[prefix])
+        move = str(frame[f"{prefix}_move"])
+        intended = str(frame[f"{prefix}_intended"])
+        changed = bool(frame[f"{prefix}_error"])
+        return html.Div(
+            [
+                html.H5(name, className="arena-player-name"),
+                html.Div("C" if move == "cooperate" else "D", className=f"arena-move arena-move-{move}"),
+                html.Strong(move.title()),
+                html.Small(
+                    f"Intended {intended.title()} · execution flipped" if changed else f"Intended {intended.title()}",
+                    className="arena-intention",
+                ),
+                html.Div(
+                    [
+                        html.Span(f"+{int(frame[f'{prefix}_points'])} this round"),
+                        html.Strong(f"{int(frame[f'{prefix}_total'])} total"),
+                    ],
+                    className="arena-score",
+                ),
+            ],
+            className=f"arena-player {'arena-player-error' if changed else ''}",
+        )
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Span(f"Round {int(frame['round'])}", className="arena-round-label"),
+                    html.Strong(str(frame["outcome"]), className="arena-outcome"),
+                ],
+                className="arena-round-header",
+            ),
+            html.Div([player_card("strategy"), html.Div("VS", className="arena-versus"), player_card("opponent")], className="arena-players"),
+            html.P(str(frame["statement"]), className="arena-statement", role="status", **{"aria-live": "polite"}),
+        ]
+    )
 
 
 @callback(
@@ -2650,6 +3489,15 @@ def pick_random_strategies(n_clicks, current_value, seed):
     rng = random.Random((base_seed + 1000003 * clicks) & 0xFFFFFFFF)
     chosen = rng.sample(names, k=k)
     return chosen, f"Selected {len(chosen)} random strategies."
+
+
+@callback(
+    Output("tournament-ranking-statement", "children"),
+    Input("tournament-state", "data"),
+    Input("tournament-rank-metric", "value"),
+)
+def render_tournament_ranking(state, metric):
+    return _tournament_ranking_statement(state, str(metric or "points_per_round"))
 
 
 @callback(
@@ -3389,6 +4237,530 @@ def update_tournament_format_notice(include_self_play, execution_error_rate):
 )
 def update_human_format_notice(execution_error_rate):
     return _game_format_notice(False, float(execution_error_rate or 0.0))
+
+
+@callback(
+    Output("evolution-population-size", "disabled"),
+    Input("evolution-model", "value"),
+)
+def toggle_evolution_population_size(model):
+    return model != "moran"
+
+
+def _experiment_insight_panel(title, insights):
+    """Render factual, data-derived observations for a completed experiment."""
+    if not insights:
+        return ""
+    return dbc.Card(
+        dbc.CardBody(
+            [
+                html.Span("RESULT HIGHLIGHTS", className="section-kicker"),
+                html.H4(title),
+                html.Ul([html.Li(insight) for insight in insights], className="mb-0"),
+            ]
+        ),
+        className="insight-panel",
+    )
+
+
+@callback(
+    Output("robustness-status", "children"),
+    Output("robustness-result", "data"),
+    Input("robustness-run", "n_clicks"),
+    Input("robustness-reset", "n_clicks"),
+    State("robustness-strategies", "value"),
+    State("robustness-start-seed", "value"),
+    State("robustness-seed-count", "value"),
+    State("robustness-seed-step", "value"),
+    State("robustness-rounds", "value"),
+    State("robustness-repetitions", "value"),
+    State("robustness-error-rate", "value"),
+    State("robustness-self-play", "value"),
+    State("robustness-horizon-known", "value"),
+    prevent_initial_call=True,
+)
+def run_robustness_sweep(
+    _run,
+    _reset,
+    strategies,
+    start_seed,
+    seed_count,
+    seed_step,
+    rounds,
+    repetitions,
+    error_rate,
+    include_self_play,
+    horizon_known,
+):
+    if dash.ctx.triggered_id == "robustness-reset":
+        return "Robustness result cleared.", None
+    try:
+        result = run_seed_sweep(
+            SeedSweepConfig(
+                strategy_names=tuple(strategies or []),
+                start_seed=int(start_seed or 0),
+                seed_count=int(seed_count or 10),
+                seed_step=int(seed_step if seed_step is not None else 1),
+                rounds_per_match=int(rounds or 50),
+                repetitions=int(repetitions or 3),
+                horizon_known=bool(horizon_known),
+                include_self_play=bool(include_self_play),
+                execution_error_rate=float(error_rate or 0.0),
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        return dbc.Alert(f"Seed sweep could not run: {exc}", color="danger"), None
+    status = dbc.Alert(
+        f"Completed {result['config']['seed_count']} independent seeds. This is an experimental robustness analysis of the selected tournament format.",
+        color="success",
+    )
+    return status, result
+
+
+@callback(
+    Output("robustness-payoff-chart", "figure"),
+    Output("robustness-rank-chart", "figure"),
+    Output("robustness-summary-table", "columns"),
+    Output("robustness-summary-table", "data"),
+    Input("robustness-result", "data"),
+)
+def render_robustness_result(result):
+    return _robustness_result_view(result)
+
+
+@callback(
+    Output("robustness-insights", "children"),
+    Input("robustness-result", "data"),
+)
+def render_robustness_insights(result):
+    return _experiment_insight_panel("What happened across seeds", _robustness_insights(result))
+
+
+@callback(
+    Output("robustness-ranking-chart", "figure"),
+    Output("robustness-ranking-statement", "children"),
+    Input("robustness-result", "data"),
+    Input("robustness-ranking-metric", "value"),
+    Input("robustness-ranking-chart", "clickData"),
+)
+def render_robustness_ranking(result, metric, click_data):
+    return _robustness_ranking_view(result, str(metric or "mean_payoff"), click_data)
+
+
+@callback(
+    Output("robustness-download", "data"),
+    Output("robustness-transfer-status", "children"),
+    Output("robustness-result", "data", allow_duplicate=True),
+    Input("robustness-export", "n_clicks"),
+    Input("robustness-import", "contents"),
+    State("robustness-result", "data"),
+    prevent_initial_call=True,
+)
+def transfer_robustness_result(_clicks, upload_contents, result):
+    try:
+        if dash.ctx.triggered_id == "robustness-export":
+            validated = validate_seed_sweep_result(result, list_strategy_names())
+            return (
+                dcc.send_string(json.dumps(validated, indent=2), "prisoners-dilemma-robustness-result.json"),
+                "Robustness result exported.",
+                dash.no_update,
+            )
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 2_000_000:
+            raise ValueError("result file exceeds 2 MB")
+        payload = json.loads(decoded.decode("utf-8"))
+        validated = validate_seed_sweep_result(payload, list_strategy_names())
+        return dash.no_update, "Robustness result opened. No tournaments were rerun.", validated
+    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Robustness result transfer failed: {exc}", dash.no_update
+
+
+@callback(
+    Output("robustness-seed-inspector", "options"),
+    Output("robustness-seed-inspector", "value"),
+    Input("robustness-result", "data"),
+)
+def configure_robustness_seed_inspector(result):
+    rows = list((result or {}).get("seed_results", []))
+    seeds = sorted({int(row["seed"]) for row in rows})
+    options = [{"label": f"Seed {seed}", "value": seed} for seed in seeds]
+    return options, seeds[0] if seeds else None
+
+
+@callback(
+    Output("robustness-seed-payoff-chart", "figure"),
+    Output("robustness-seed-cooperation-chart", "figure"),
+    Output("robustness-seed-table", "columns"),
+    Output("robustness-seed-table", "data"),
+    Input("robustness-result", "data"),
+    Input("robustness-seed-inspector", "value"),
+)
+def inspect_robustness_seed(result, seed):
+    return _robustness_seed_view(result, seed)
+
+
+@callback(
+    Output("evolution-population-table", "data"),
+    Input("evolution-strategies", "value"),
+    Input("evolution-preset", "value"),
+    Input("evolution-seed", "value"),
+    State("evolution-population-table", "data"),
+)
+def update_evolution_population(strategies, preset, seed, current_rows):
+    names = list(dict.fromkeys(strategies or []))
+    if not names:
+        return []
+    current = {
+        str(row.get("strategy")): float(row.get("share", 0))
+        for row in (current_rows or [])
+        if isinstance(row, dict) and row.get("strategy") in names
+    }
+    if dash.ctx.triggered_id == "evolution-strategies" and set(current) == set(names) and sum(current.values()) > 0:
+        total = sum(current.values())
+        shares = {name: current[name] / total for name in names}
+    elif preset == "invasion" and len(names) >= 2:
+        shares = {name: 0.0 for name in names}
+        shares[names[0]] = 0.99
+        shares[names[1]] = 0.01
+    elif preset == "random":
+        rng = random.Random(int(seed or 0))
+        weights = {name: rng.random() for name in names}
+        total = sum(weights.values()) or 1.0
+        shares = {name: value / total for name, value in weights.items()}
+    else:
+        shares = {name: 1.0 / len(names) for name in names}
+    return [{"strategy": name, "share": round(shares[name], 8)} for name in names]
+
+
+@callback(
+    Output("evolution-config-download", "data"),
+    Output("evolution-transfer-status", "children"),
+    Output("evolution-strategies", "value", allow_duplicate=True),
+    Output("evolution-generations", "value", allow_duplicate=True),
+    Output("evolution-rounds", "value", allow_duplicate=True),
+    Output("evolution-seed", "value", allow_duplicate=True),
+    Output("evolution-selection", "value", allow_duplicate=True),
+    Output("evolution-mutation", "value", allow_duplicate=True),
+    Output("evolution-repetitions", "value", allow_duplicate=True),
+    Output("evolution-error-rate", "value", allow_duplicate=True),
+    Output("evolution-horizon-known", "value", allow_duplicate=True),
+    Output("evolution-model", "value", allow_duplicate=True),
+    Output("evolution-population-size", "value", allow_duplicate=True),
+    Output("evolution-population-table", "data", allow_duplicate=True),
+    Input("evolution-export", "n_clicks"),
+    Input("evolution-import", "contents"),
+    State("evolution-strategies", "value"),
+    State("evolution-generations", "value"),
+    State("evolution-rounds", "value"),
+    State("evolution-seed", "value"),
+    State("evolution-selection", "value"),
+    State("evolution-mutation", "value"),
+    State("evolution-repetitions", "value"),
+    State("evolution-error-rate", "value"),
+    State("evolution-horizon-known", "value"),
+    State("evolution-model", "value"),
+    State("evolution-population-size", "value"),
+    State("evolution-population-table", "data"),
+    prevent_initial_call=True,
+)
+def transfer_evolution_config(_export, upload_contents, strategies, generations, rounds, seed, selection, mutation, repetitions, error_rate, horizon_known, model, population_size, population_rows):
+    unchanged = (dash.no_update,) * 12
+    try:
+        if dash.ctx.triggered_id == "evolution-export":
+            shares = {
+                str(row.get("strategy")): float(row.get("share", 0))
+                for row in (population_rows or [])
+                if isinstance(row, dict) and row.get("strategy")
+            }
+            config = normalize_evolution_config(
+                EvolutionConfig(
+                    strategy_names=tuple(strategies or []),
+                    initial_shares=shares,
+                    generations=int(generations or 100),
+                    rounds_per_match=int(rounds or 20),
+                    repetitions=int(repetitions or 3),
+                    seed=int(seed or 0),
+                    selection_strength=float(selection if selection is not None else 1.0),
+                    mutation_rate=float(mutation or 0.0),
+                    execution_error_rate=float(error_rate or 0.0),
+                    horizon_known=bool(horizon_known),
+                    model=str(model or "replicator"),
+                    population_size=int(population_size or 100),
+                )
+            )
+            payload = {
+                "schema_version": 1,
+                "experiment_type": "evolution",
+                "game": "prisoners_dilemma",
+                "game_version": 1,
+                "config": config.to_dict(),
+            }
+            return dcc.send_string(json.dumps(payload, indent=2), "prisoners-dilemma-evolution.json"), "Evolution settings exported.", *unchanged
+
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 100_000:
+            raise ValueError("configuration file exceeds 100 KB")
+        payload = json.loads(decoded.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("unsupported or missing schema_version")
+        if payload.get("experiment_type") != "evolution":
+            raise ValueError("experiment_type must be evolution")
+        if payload.get("game") != "prisoners_dilemma" or payload.get("game_version") != 1:
+            raise ValueError("unsupported game or game_version")
+        raw = payload.get("config")
+        if not isinstance(raw, dict):
+            raise ValueError("config must be an object")
+        config = normalize_evolution_config(
+            EvolutionConfig(
+                strategy_names=tuple(raw.get("strategy_names", [])),
+                initial_shares=dict(raw.get("initial_shares", {})),
+                generations=raw.get("generations", 100),
+                rounds_per_match=raw.get("rounds_per_match", 20),
+                repetitions=raw.get("repetitions", 3),
+                seed=raw.get("seed", 0),
+                selection_strength=raw.get("selection_strength", 1.0),
+                mutation_rate=raw.get("mutation_rate", 0.0),
+                execution_error_rate=raw.get("execution_error_rate", 0.0),
+                horizon_known=raw.get("horizon_known", False),
+                model=raw.get("model", "replicator"),
+                population_size=raw.get("population_size", 100),
+            )
+        )
+        unknown = sorted(set(config.strategy_names) - set(list_strategy_names()))
+        if unknown:
+            raise ValueError(f"unknown evolution strategies: {', '.join(unknown)}")
+        rows = [{"strategy": name, "share": config.initial_shares[name]} for name in config.strategy_names]
+        return (
+            dash.no_update,
+            "Evolution settings imported. Review them before running.",
+            list(config.strategy_names),
+            config.generations,
+            config.rounds_per_match,
+            config.seed,
+            config.selection_strength,
+            config.mutation_rate,
+            config.repetitions,
+            config.execution_error_rate,
+            config.horizon_known,
+            config.model,
+            config.population_size,
+            rows,
+        )
+    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Evolution import failed: {exc}", *unchanged
+
+
+@callback(
+    Output("evolution-status", "children"),
+    Output("evolution-population-chart", "figure"),
+    Output("evolution-outcomes-chart", "figure"),
+    Output("evolution-final-table", "columns"),
+    Output("evolution-final-table", "data"),
+    Output("evolution-result", "data"),
+    Input("evolution-run", "n_clicks"),
+    Input("evolution-reset", "n_clicks"),
+    State("evolution-strategies", "value"),
+    State("evolution-generations", "value"),
+    State("evolution-rounds", "value"),
+    State("evolution-seed", "value"),
+    State("evolution-selection", "value"),
+    State("evolution-mutation", "value"),
+    State("evolution-repetitions", "value"),
+    State("evolution-error-rate", "value"),
+    State("evolution-horizon-known", "value"),
+    State("evolution-model", "value"),
+    State("evolution-population-size", "value"),
+    State("evolution-population-table", "data"),
+    prevent_initial_call=True,
+)
+def run_evolution(_clicks, _reset, strategies, generations, rounds, seed, selection_strength, mutation_rate, repetitions, error_rate, horizon_known, model, population_size, population_rows):
+    if dash.ctx.triggered_id == "evolution-reset":
+        empty = go.Figure()
+        return "Evolution result cleared.", empty, empty, [], [], None
+    names = list(strategies or [])
+    try:
+        initial_shares = {
+            str(row.get("strategy")): float(row.get("share", 0))
+            for row in (population_rows or [])
+            if isinstance(row, dict) and row.get("strategy") in names
+        }
+        config = normalize_evolution_config(
+            EvolutionConfig(
+                strategy_names=tuple(names),
+                initial_shares=initial_shares,
+                generations=int(generations or 100),
+                rounds_per_match=int(rounds or 20),
+                repetitions=int(repetitions or 3),
+                seed=int(seed or 0),
+                selection_strength=float(selection_strength if selection_strength is not None else 1.0),
+                mutation_rate=float(mutation_rate or 0.0),
+                execution_error_rate=float(error_rate or 0.0),
+                horizon_known=bool(horizon_known),
+                model=str(model or "replicator"),
+                population_size=int(population_size or 100),
+            )
+        )
+        results = simulate_tournament(
+            strategy_names=list(config.strategy_names),
+            rounds_per_match=config.rounds_per_match,
+            repetitions=config.repetitions,
+            seed=config.seed,
+            horizon_known=config.horizon_known,
+            include_self_play=True,
+            execution_error_rate=config.execution_error_rate,
+        )
+        stats = matchup_statistics(results, names)
+        if config.model == "moran":
+            history = evolve_moran_population(
+                names,
+                stats,
+                generations=config.generations,
+                population_size=config.population_size,
+                initial_shares=config.initial_shares,
+                selection_strength=config.selection_strength,
+                mutation_rate=config.mutation_rate,
+                seed=config.seed,
+            )
+        else:
+            history = evolve_population(
+                names,
+                stats,
+                generations=config.generations,
+                initial_shares=config.initial_shares,
+                selection_strength=config.selection_strength,
+                mutation_rate=config.mutation_rate,
+            )
+    except (TypeError, ValueError) as exc:
+        empty = go.Figure()
+        return dbc.Alert(f"Evolution could not run: {exc}", color="danger"), empty, empty, [], [], None
+
+    population_figure, outcomes_figure, columns, table_rows = _evolution_result_view(history, names)
+    status = dbc.Alert(
+        f"Completed {config.generations} generations with the {config.model} model. This experimental population model uses the classic Prisoner’s Dilemma payoff matrix.",
+        color="success",
+    )
+    result_state = build_evolution_result(config, history, stats)
+    return status, population_figure, outcomes_figure, columns, table_rows, result_state
+
+
+@callback(
+    Output("evolution-insights", "children"),
+    Input("evolution-result", "data"),
+)
+def render_evolution_insights(result_state):
+    return _experiment_insight_panel("What changed in the population", _evolution_insights(result_state))
+
+
+@callback(
+    Output("evolution-result-download", "data"),
+    Output("evolution-result-transfer-status", "children"),
+    Output("evolution-result", "data", allow_duplicate=True),
+    Input("evolution-result-export", "n_clicks"),
+    Input("evolution-result-import", "contents"),
+    State("evolution-result", "data"),
+    prevent_initial_call=True,
+)
+def transfer_evolution_result(_export, upload_contents, result_state):
+    """Export a completed run or open one for read-only generation inspection."""
+    try:
+        if dash.ctx.triggered_id == "evolution-result-export":
+            validated = validate_evolution_result(result_state, list_strategy_names())
+            return (
+                dcc.send_string(json.dumps(validated, indent=2), "prisoners-dilemma-evolution-result.json"),
+                "Evolution result exported.",
+                dash.no_update,
+            )
+        encoded = str(upload_contents or "").split(",", 1)[1]
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) > 2_000_000:
+            raise ValueError("result file exceeds 2 MB")
+        payload = json.loads(decoded.decode("utf-8"))
+        validated = validate_evolution_result(payload, list_strategy_names())
+        return dash.no_update, "Evolution result opened in read-only inspection mode. No matches were rerun.", validated
+    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return dash.no_update, f"Evolution result transfer failed: {exc}", dash.no_update
+
+
+@callback(
+    Output("evolution-generation", "max"),
+    Output("evolution-generation", "marks"),
+    Output("evolution-generation", "value"),
+    Input("evolution-result", "data"),
+)
+def configure_evolution_generation_slider(result_state):
+    history = list((result_state or {}).get("history", []))
+    if not history:
+        return 1, {0: "0"}, 0
+    maximum = int(history[-1].get("generation", len(history) - 1))
+    step = max(1, maximum // 5)
+    marks = {value: str(value) for value in range(0, maximum + 1, step)}
+    marks[maximum] = str(maximum)
+    return maximum, marks, maximum
+
+
+@callback(
+    Output("evolution-generation-summary", "children"),
+    Output("evolution-generation-table", "columns"),
+    Output("evolution-generation-table", "data"),
+    Output("evolution-event-log", "children"),
+    Input("evolution-result", "data"),
+    Input("evolution-generation", "value"),
+)
+def inspect_evolution_generation(result_state, generation):
+    history = list((result_state or {}).get("history", []))
+    if not history:
+        return "Run an evolution experiment to inspect its generations.", [], [], "No events."
+    index = max(0, min(int(generation or 0), len(history) - 1))
+    current = history[index]
+    previous = history[index - 1] if index > 0 else None
+    shares = dict(current.get("shares", {}))
+    fitness = dict(current.get("fitness", {}))
+    previous_shares = dict(previous.get("shares", {})) if previous else shares
+    table_rows = [
+        {
+            "strategy": name,
+            "share": float(share),
+            "change": float(share) - float(previous_shares.get(name, 0.0)),
+            "fitness": float(fitness.get(name, 0.0)),
+        }
+        for name, share in shares.items()
+    ]
+    table_rows.sort(key=lambda row: row["share"], reverse=True)
+    columns = [
+        {"name": "Strategy", "id": "strategy"},
+        {"name": "Share", "id": "share", "type": "numeric", "format": {"specifier": ".1%"}},
+        {"name": "Change", "id": "change", "type": "numeric", "format": {"specifier": "+.2%"}},
+        {"name": "Fitness", "id": "fitness", "type": "numeric", "format": {"specifier": ".3f"}},
+    ]
+    leader = table_rows[0]["strategy"] if table_rows else "Not available"
+    summary = dbc.Row(
+        [
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Generation"), html.H4(str(index))])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Largest population"), html.H4(leader)])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Average payoff"), html.H4(f"{float(current.get('average_payoff', 0)):.3f}")])), md=3),
+            dbc.Col(dbc.Card(dbc.CardBody([html.Small("Cooperation"), html.H4(f"{float(current.get('cooperation_rate', 0)):.1%}")])), md=3),
+        ],
+        className="g-2 mb-3",
+    )
+    events = [event for event in list((result_state or {}).get("events", [])) if int(event.get("generation", 0)) <= index]
+    event_children = (
+        html.Ul([html.Li([html.Strong(f"Generation {event['generation']}: "), str(event["message"])]) for event in events])
+        if events
+        else html.P("No recorded events through this generation.", className="muted")
+    )
+    return summary, columns, table_rows, event_children
+
+
+@callback(
+    Output("evolution-generation-ranking", "figure"),
+    Output("evolution-generation-ranking-statement", "children"),
+    Input("evolution-result", "data"),
+    Input("evolution-generation", "value"),
+)
+def render_evolution_generation_ranking(result_state, generation):
+    return _evolution_generation_ranking_view(result_state, generation)
 
 
 @callback(

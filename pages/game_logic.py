@@ -356,6 +356,213 @@ class EntropyBroker(Strategy):
         return "cooperate" if window.count("cooperate") >= window.count("defect") else "defect"
 
 
+class ForgetfulGrudger(Strategy):
+    """Punishes a defection for ten decisions, then returns to cooperation."""
+
+    def __init__(self, name: str, punishment_length: int = 10):
+        super().__init__(name)
+        self.seen = 0
+        self.punishment_length = punishment_length
+        self.punish_left = 0
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if "defect" in opponent_history[self.seen :]:
+            self.punish_left = self.punishment_length
+        self.seen = len(opponent_history)
+        if self.punish_left:
+            self.punish_left -= 1
+            return "defect"
+        return "cooperate"
+
+
+class StochasticPavlov(Strategy):
+    """Win-Stay, Lose-Shift with a five percent decision-flip probability."""
+
+    def __init__(self, name: str, flip_probability: float = 0.05):
+        super().__init__(name)
+        self.last_move: Move = "cooperate"
+        self.flip_probability = flip_probability
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if not opponent_history:
+            move: Move = "cooperate"
+        else:
+            previous_payoff, _ = payoff(self.last_move, opponent_history[-1])
+            move = self.last_move if previous_payoff in (3, 5) else (
+                "defect" if self.last_move == "cooperate" else "cooperate"
+            )
+        if self.rng.random() < self.flip_probability:
+            move = "defect" if move == "cooperate" else "cooperate"
+        self.last_move = move
+        return move
+
+
+class Appeaser(Strategy):
+    """Repeats its action after cooperation and switches after defection."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.last_move: Move = "cooperate"
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if opponent_history and opponent_history[-1] == "defect":
+            self.last_move = "defect" if self.last_move == "cooperate" else "cooperate"
+        return self.last_move
+
+
+class Forgiver(Strategy):
+    """Retaliates once after a defection and then makes a reconciliation move."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.seen = 0
+        self.reconcile_next = False
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        new_defection = "defect" in opponent_history[self.seen :]
+        self.seen = len(opponent_history)
+        if self.reconcile_next:
+            self.reconcile_next = False
+            return "cooperate"
+        if new_defection:
+            self.reconcile_next = True
+            return "defect"
+        return "cooperate"
+
+
+class MemoryOnePlayer(Strategy):
+    """Configurable stochastic policy conditioned on the previous round outcome."""
+
+    def __init__(
+        self,
+        name: str,
+        probabilities: tuple[float, float, float, float] = (0.9, 0.2, 0.8, 0.1),
+        initial_cooperation: float = 1.0,
+    ):
+        super().__init__(name)
+        self.probabilities = probabilities
+        self.initial_cooperation = initial_cooperation
+        self.last_move: Move | None = None
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if self.last_move is None or not opponent_history:
+            probability = self.initial_cooperation
+        else:
+            outcome_index = {
+                ("cooperate", "cooperate"): 0,
+                ("cooperate", "defect"): 1,
+                ("defect", "cooperate"): 2,
+                ("defect", "defect"): 3,
+            }[(self.last_move, opponent_history[-1])]
+            probability = self.probabilities[outcome_index]
+        self.last_move = "cooperate" if self.rng.random() < probability else "defect"
+        return self.last_move
+
+
+class ReactivePlayer(MemoryOnePlayer):
+    """Cooperates with fixed probabilities after cooperation and defection."""
+
+    def __init__(self, name: str, after_cooperation: float = 0.9, after_defection: float = 0.2):
+        super().__init__(
+            name,
+            (after_cooperation, after_defection, after_cooperation, after_defection),
+            1.0,
+        )
+
+
+class ZDExtort2(MemoryOnePlayer):
+    """A memory-one extortionate zero-determinant policy for the classic matrix."""
+
+    def __init__(self, name: str):
+        super().__init__(name, (8 / 9, 1 / 2, 1 / 3, 0), 1.0)
+
+
+class ZDGenerous2(MemoryOnePlayer):
+    """A generous zero-determinant memory-one policy for the classic matrix."""
+
+    def __init__(self, name: str):
+        super().__init__(name, (1.0, 1 / 8, 1.0, 1 / 4), 1.0)
+
+
+class ZDEqualizer(MemoryOnePlayer):
+    """A research memory-one equalizer preset for the classic payoff matrix."""
+
+    def __init__(self, name: str):
+        super().__init__(name, (0.75, 0.25, 0.50, 0.25), 1.0)
+
+
+class Handshake(Strategy):
+    """Recognizes a C-D-C-C opening and otherwise switches to defection."""
+
+    pattern: tuple[Move, ...] = ("cooperate", "defect", "cooperate", "cooperate")
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        turn = len(opponent_history)
+        if turn < len(self.pattern):
+            return self.pattern[turn]
+        if tuple(opponent_history[: len(self.pattern)]) == self.pattern:
+            return opponent_history[-1]
+        return "defect"
+
+
+class AdaptiveBestResponse(Strategy):
+    """Learns conditional cooperation rates and chooses the higher expected payoff."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.last_move: Move | None = None
+        self.seen = 0
+        self.counts = {"cooperate": [1, 2], "defect": [1, 2]}
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if self.last_move is not None and len(opponent_history) > self.seen:
+            cooperations, observations = self.counts[self.last_move]
+            cooperations += int(opponent_history[-1] == "cooperate")
+            self.counts[self.last_move] = [cooperations, observations + 1]
+        self.seen = len(opponent_history)
+        p_after_c = self.counts["cooperate"][0] / self.counts["cooperate"][1]
+        p_after_d = self.counts["defect"][0] / self.counts["defect"][1]
+        cooperate_value = 3 * p_after_c
+        defect_value = 1 + 4 * p_after_d
+        self.last_move = "cooperate" if cooperate_value >= defect_value else "defect"
+        return self.last_move
+
+
+class HedgeMetaStrategy(Strategy):
+    """Combines four simple experts using deterministic multiplicative weights."""
+
+    experts = ("nice", "defect", "tft", "pavlov")
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.weights = {expert: 1.0 for expert in self.experts}
+        self.last_recommendations: dict[str, Move] = {}
+        self.last_move: Move = "cooperate"
+        self.seen = 0
+
+    def _recommendations(self, opponent_history: list[Move]) -> dict[str, Move]:
+        previous = opponent_history[-1] if opponent_history else "cooperate"
+        previous_payoff, _ = payoff(self.last_move, previous)
+        pavlov = self.last_move if previous_payoff in (3, 5) else (
+            "defect" if self.last_move == "cooperate" else "cooperate"
+        )
+        return {"nice": "cooperate", "defect": "defect", "tft": previous, "pavlov": pavlov}
+
+    def play(self, opponent_history: list[Move]) -> Move:
+        if self.last_recommendations and len(opponent_history) > self.seen:
+            opponent_move = opponent_history[-1]
+            for expert, recommendation in self.last_recommendations.items():
+                reward, _ = payoff(recommendation, opponent_move)
+                self.weights[expert] *= 1.0 + reward / 10.0
+        self.seen = len(opponent_history)
+        recommendations = self._recommendations(opponent_history)
+        cooperate_weight = sum(self.weights[e] for e, move in recommendations.items() if move == "cooperate")
+        defect_weight = sum(self.weights[e] for e, move in recommendations.items() if move == "defect")
+        self.last_move = "cooperate" if cooperate_weight >= defect_weight else "defect"
+        self.last_recommendations = recommendations
+        return self.last_move
+
+
 class SuspiciousTitForTat(Strategy):
     """
     Suspicious Tit-for-Tat (STFT): starts with defect, then mirrors the opponent.
@@ -1055,6 +1262,18 @@ def make_strategy_factories() -> list[Callable[[], Strategy]]:
         lambda: DebtCollector("DebtCollector"),
         lambda: PatternHunter("PatternHunter"),
         lambda: EntropyBroker("EntropyBroker"),
+        lambda: ForgetfulGrudger("ForgetfulGrudger"),
+        lambda: StochasticPavlov("StochasticPavlov"),
+        lambda: Appeaser("Appeaser"),
+        lambda: Forgiver("Forgiver"),
+        lambda: ReactivePlayer("ReactivePlayer"),
+        lambda: MemoryOnePlayer("MemoryOnePlayer"),
+        lambda: ZDExtort2("ZDExtort2"),
+        lambda: ZDGenerous2("ZDGenerous2"),
+        lambda: ZDEqualizer("ZDEqualizer"),
+        lambda: Handshake("Handshake"),
+        lambda: AdaptiveBestResponse("AdaptiveBestResponse"),
+        lambda: HedgeMetaStrategy("HedgeMetaStrategy"),
         lambda: SuspiciousTitForTat("SuspiciousTitForTat"),
         lambda: GenerousTitForTat("GenerousTitForTat"),
         lambda: Joss("Joss"),
@@ -1099,6 +1318,7 @@ def list_strategy_names() -> list[str]:
 
 def simulate_tournament(
     *,
+    strategy_names: Optional[list[str]] = None,
     rounds_per_match: int = 10,
     repetitions: int = 30,
     seed: Optional[int] = 0,
@@ -1127,6 +1347,17 @@ def simulate_tournament(
     rng = random.Random(seed)
 
     factories = make_strategy_factories()
+    if strategy_names is not None:
+        requested = [_canonical_strategy_name(str(name)) for name in strategy_names]
+        if len(requested) < 2:
+            raise ValueError("strategy_names must contain at least 2 strategies")
+        if len(requested) != len(set(requested)):
+            raise ValueError("strategy_names must not contain duplicates")
+        factory_by_name = {factory().name: factory for factory in factories}
+        unknown = [name for name in requested if name not in factory_by_name]
+        if unknown:
+            raise ValueError(f"Unknown strategy name(s): {', '.join(repr(name) for name in unknown)}")
+        factories = [factory_by_name[name] for name in requested]
     rows: list[dict] = []
 
     def _maybe_set_total_rounds(s: Strategy) -> None:
@@ -1265,6 +1496,27 @@ def _init_strategy_state(name: str, custom_config: Optional[dict] = None) -> dic
         return {"seen": 0, "opp_defections": 0, "retaliate_left": 0, "calm_left": 0}
     if name == "DebtCollector":
         return {"seen": 0, "debt": 0}
+    if name == "ForgetfulGrudger":
+        return {"seen": 0, "punish_left": 0}
+    if name in {"StochasticPavlov", "Appeaser"}:
+        return {"last_move": "cooperate"}
+    if name == "Forgiver":
+        return {"seen": 0, "reconcile_next": False}
+    if name in {"ReactivePlayer", "MemoryOnePlayer", "ZDExtort2", "ZDGenerous2", "ZDEqualizer"}:
+        return {"last_move": None}
+    if name == "AdaptiveBestResponse":
+        return {
+            "last_move": None,
+            "seen": 0,
+            "counts": {"cooperate": [1, 2], "defect": [1, 2]},
+        }
+    if name == "HedgeMetaStrategy":
+        return {
+            "weights": {"nice": 1.0, "defect": 1.0, "tft": 1.0, "pavlov": 1.0},
+            "last_recommendations": {},
+            "last_move": "cooperate",
+            "seen": 0,
+        }
     if name in {"BadAlternator", "RitualDefection", "TripleThreat", "Pushover", "Thief", "Pattern"}:
         return {"turn": 0}
     if name == "NeverSwitchUp":
@@ -1478,6 +1730,126 @@ def play_strategy(name: str, opponent_history: list[Move], state: dict, rng_stat
             switches = sum(left != right for left, right in zip(window, window[1:]))
             move = "defect" if switches >= len(window) - 2 else ("cooperate" if window.count("cooperate") >= window.count("defect") else "defect")
         return move, state, rng_state
+    if name == "ForgetfulGrudger":
+        seen = int(state.get("seen", 0))
+        punish_left = int(state.get("punish_left", 0))
+        if "defect" in opponent_history[seen:]:
+            punish_left = 10
+        seen = len(opponent_history)
+        if punish_left:
+            punish_left -= 1
+            move: Move = "defect"
+        else:
+            move = "cooperate"
+        return move, {**state, "seen": seen, "punish_left": punish_left}, rng_state
+    if name == "StochasticPavlov":
+        last_move = state.get("last_move", "cooperate")
+        if last_move not in ("cooperate", "defect"):
+            last_move = "cooperate"
+        if not opponent_history:
+            move = "cooperate"
+        else:
+            previous_payoff, _ = payoff(last_move, opponent_history[-1])
+            move = last_move if previous_payoff in (3, 5) else (
+                "defect" if last_move == "cooperate" else "cooperate"
+            )
+        sample, rng_state = _lcg_float01(rng_state)
+        if sample < 0.05:
+            move = "defect" if move == "cooperate" else "cooperate"
+        return move, {**state, "last_move": move}, rng_state
+    if name == "Appeaser":
+        last_move = state.get("last_move", "cooperate")
+        if last_move not in ("cooperate", "defect"):
+            last_move = "cooperate"
+        if opponent_history and opponent_history[-1] == "defect":
+            last_move = "defect" if last_move == "cooperate" else "cooperate"
+        return last_move, {**state, "last_move": last_move}, rng_state
+    if name == "Forgiver":
+        seen = int(state.get("seen", 0))
+        reconcile_next = bool(state.get("reconcile_next", False))
+        new_defection = "defect" in opponent_history[seen:]
+        seen = len(opponent_history)
+        if reconcile_next:
+            move = "cooperate"
+            reconcile_next = False
+        elif new_defection:
+            move = "defect"
+            reconcile_next = True
+        else:
+            move = "cooperate"
+        return move, {**state, "seen": seen, "reconcile_next": reconcile_next}, rng_state
+    if name in {"ReactivePlayer", "MemoryOnePlayer", "ZDExtort2", "ZDGenerous2", "ZDEqualizer"}:
+        settings = {
+            "ReactivePlayer": ((0.9, 0.2, 0.9, 0.2), 1.0),
+            "MemoryOnePlayer": ((0.9, 0.2, 0.8, 0.1), 1.0),
+            "ZDExtort2": ((8 / 9, 1 / 2, 1 / 3, 0), 1.0),
+            "ZDGenerous2": ((1.0, 1 / 8, 1.0, 1 / 4), 1.0),
+            "ZDEqualizer": ((0.75, 0.25, 0.50, 0.25), 1.0),
+        }
+        probabilities, opening = settings[name]
+        last_move = state.get("last_move")
+        if last_move not in ("cooperate", "defect") or not opponent_history:
+            probability = opening
+        else:
+            index = {
+                ("cooperate", "cooperate"): 0,
+                ("cooperate", "defect"): 1,
+                ("defect", "cooperate"): 2,
+                ("defect", "defect"): 3,
+            }[(last_move, opponent_history[-1])]
+            probability = probabilities[index]
+        sample, rng_state = _lcg_float01(rng_state)
+        move = "cooperate" if sample < probability else "defect"
+        return move, {**state, "last_move": move}, rng_state
+    if name == "Handshake":
+        pattern: tuple[Move, ...] = ("cooperate", "defect", "cooperate", "cooperate")
+        turn = len(opponent_history)
+        if turn < len(pattern):
+            return pattern[turn], state, rng_state
+        if tuple(opponent_history[: len(pattern)]) == pattern:
+            return opponent_history[-1], state, rng_state
+        return "defect", state, rng_state
+    if name == "AdaptiveBestResponse":
+        last_move = state.get("last_move")
+        seen = int(state.get("seen", 0))
+        raw_counts = state.get("counts", {"cooperate": [1, 2], "defect": [1, 2]})
+        counts = {key: list(value) for key, value in raw_counts.items()}
+        if last_move in ("cooperate", "defect") and len(opponent_history) > seen:
+            counts[last_move][0] += int(opponent_history[-1] == "cooperate")
+            counts[last_move][1] += 1
+        p_after_c = counts["cooperate"][0] / counts["cooperate"][1]
+        p_after_d = counts["defect"][0] / counts["defect"][1]
+        move = "cooperate" if 3 * p_after_c >= 1 + 4 * p_after_d else "defect"
+        return move, {**state, "last_move": move, "seen": len(opponent_history), "counts": counts}, rng_state
+    if name == "HedgeMetaStrategy":
+        weights = {key: float(value) for key, value in state.get("weights", {}).items()}
+        for expert in ("nice", "defect", "tft", "pavlov"):
+            weights.setdefault(expert, 1.0)
+        last_recommendations = state.get("last_recommendations", {})
+        seen = int(state.get("seen", 0))
+        last_move = state.get("last_move", "cooperate")
+        if last_move not in ("cooperate", "defect"):
+            last_move = "cooperate"
+        if last_recommendations and len(opponent_history) > seen:
+            for expert, recommendation in last_recommendations.items():
+                reward, _ = payoff(recommendation, opponent_history[-1])
+                weights[expert] *= 1.0 + reward / 10.0
+        previous = opponent_history[-1] if opponent_history else "cooperate"
+        previous_payoff, _ = payoff(last_move, previous)
+        pavlov = last_move if previous_payoff in (3, 5) else (
+            "defect" if last_move == "cooperate" else "cooperate"
+        )
+        recommendations = {"nice": "cooperate", "defect": "defect", "tft": previous, "pavlov": pavlov}
+        cooperate_weight = sum(weights[e] for e, recommendation in recommendations.items() if recommendation == "cooperate")
+        defect_weight = sum(weights[e] for e, recommendation in recommendations.items() if recommendation == "defect")
+        move = "cooperate" if cooperate_weight >= defect_weight else "defect"
+        return move, {
+            **state,
+            "weights": weights,
+            "last_recommendations": recommendations,
+            "last_move": move,
+            "seen": len(opponent_history),
+        }, rng_state
     if name == "WinStayLoseShift":
         last_move = state.get("last_move", "cooperate")
         if last_move not in ("cooperate", "defect"):
